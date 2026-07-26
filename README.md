@@ -7,10 +7,10 @@ It identifies every connected micro:bit by its pyOCD **Unique ID**, joins that t
 the board's `/dev/cu.*` serial port (via `ioreg` on macOS) and its firmware
 `DEVICE:` announcement, and keeps a persistent registry at `config/devices.json`
 (relative to the project you run it in). `probe` records each board and assigns
-it a stable enumeration number (1..N); `deploy` then targets a specific known
-device — by enum number, 5-char micro:bit name, serial path, or UID — and
-refuses to flash a board recorded as the radio relay unless `--force-relay` is
-given.
+it a stable enumeration number (1..N); `list` and `probe` show the board's
+`device_name`, while `deploy` targets a specific known device by enum number,
+common name, serial path, or UID and refuses to flash a board recorded as the
+radio relay unless `--force-relay` is given.
 
 ## Installation
 
@@ -44,7 +44,7 @@ paths are CWD-relative, with `--config` / `--hex` / `--build-cmd` overrides.
 | `build`    | Compile the micro:bit firmware. |
 | `deploy`   | Flash firmware to one or more micro:bit devices. |
 | `list`     | List all detected micro:bit devices. |
-| `probe`    | Probe a device and report its state. |
+| `probe`    | Probe all connected devices and update the registry. Use `--clear` to rebuild it from live devices only. |
 
 Run `mbdeploy --help` or `mbdeploy <subcommand> --help` for full usage.
 

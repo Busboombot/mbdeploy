@@ -188,7 +188,7 @@ def assign_enum(devices: dict[str, dict], uid: str) -> int:
     return max(existing, default=0) + 1
 
 
-def probe_all(config_path: Path) -> list[dict]:
+def probe_all(config_path: Path, clear: bool = False) -> list[dict]:
     """Discover all connected probes, probe each port, update and save the registry.
 
     Merge logic
@@ -201,7 +201,7 @@ def probe_all(config_path: Path) -> list[dict]:
 
     Returns the updated list of device dicts.
     """
-    devices = load_devices(config_path)
+    devices = {} if clear else load_devices(config_path)
     probes = flashable_probes()
     uids = {p["uid"] for p in probes}
     ports = port_serial_map(uids)
@@ -236,7 +236,7 @@ def resolve_target(token: str, devices: dict[str, dict]) -> dict:
     1. Pure digits → match by ``enum`` field.
     2. Starts with ``/dev/`` or contains ``/`` → match by ``port`` field.
     3. 40–52 hex characters → match by ``uid`` field.
-    4. Otherwise → case-insensitive match on ``common_name`` or ``device_name``.
+    4. Otherwise → case-insensitive match on ``common_name``.
 
     Raises ``ValueError`` with a descriptive message if no match is found.
     """
@@ -262,10 +262,9 @@ def resolve_target(token: str, devices: dict[str, dict]) -> dict:
                 return entry
         raise ValueError(f"No device found with uid '{token}'")
 
-    # 4. Name (common_name or device_name, case-insensitive)
+    # 4. Name (common_name, case-insensitive)
     token_lower = token.lower()
     for entry in devices.values():
-        if (entry.get("common_name", "").lower() == token_lower or
-                entry.get("device_name", "").lower() == token_lower):
+        if entry.get("common_name", "").lower() == token_lower:
             return entry
     raise ValueError(f"No device found matching '{token}'")

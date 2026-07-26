@@ -7,6 +7,7 @@ exercised via tmp_path fixtures.
 
 from __future__ import annotations
 
+import json
 import argparse
 import sys
 from pathlib import Path
@@ -132,11 +133,10 @@ class TestResolveTarget:
         result = resolve_target("gutov", self._registry())
         assert result["uid"] == _DEVICE_UID
 
-    def test_resolve_by_device_name(self):
-        """Name token falls through to device_name when common_name differs."""
-        # relay1 entry: common_name="bridge1", device_name="relay1"
-        result = resolve_target("relay1", self._registry())
-        assert result["uid"] == _RELAY_UID
+    def test_resolve_by_device_name_is_not_supported(self):
+        """Deploy target names should resolve via common_name only."""
+        with pytest.raises(ValueError, match="No device found"):
+            resolve_target("relay1", self._registry())
 
     def test_resolve_unknown_raises(self):
         with pytest.raises(ValueError, match="No device found"):
@@ -196,6 +196,74 @@ class TestRelayGuard:
         rc = _cmd_deploy(args)
         # Guard passed; result depends on mock subprocess — we accept 0 here
         assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# list / probe display names
+# ---------------------------------------------------------------------------
+
+class TestDisplayNames:
+    def test_list_shows_device_name(self, monkeypatch, capsys, tmp_path):
+        config = tmp_path / "devices.json"
+        registry = {_DEVICE_UID: _DEVICE_ENTRY.copy()}
+
+        monkeypatch.setattr(devices_mod, "flashable_probes", lambda: [{"uid": _DEVICE_UID, "description": "dev"}])
+        monkeypatch.setattr(devices_mod, "port_serial_map", lambda known: {_DEVICE_UID: "/dev/cu.device1"})
+        monkeypatch.setattr(devices_mod, "load_devices", lambda _path: registry)
+
+        from mbdeploy.cli import _cmd_list
+
+        rc = _cmd_list(argparse.Namespace(config=str(config)))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "DEVICE NAME" in out
+        assert "gutov-main" in out
+        assert "gutov\n" not in out
+
+
+class TestProbeClear:
+    def test_probe_clear_rebuilds_registry_from_live_devices(self, monkeypatch, tmp_path):
+        config = tmp_path / "devices.json"
+        config.write_text(json.dumps({_RELAY_UID: {"uid": _RELAY_UID, "enum": 1, "common_name": "stale"}}))
+
+        monkeypatch.setattr(devices_mod, "flashable_probes", lambda: [{"uid": _DEVICE_UID, "description": "dev"}])
+        monkeypatch.setattr(devices_mod, "port_serial_map", lambda known: {_DEVICE_UID: "/dev/cu.device1"})
+        monkeypatch.setattr(
+            devices_mod,
+            "probe_type",
+            lambda port: {
+                "role": "Nezha2",
+                "common_name": "gutov",
+                "device_name": "gutov-main",
+                "serial": "SERIAL",
+                "raw": "DEVICE:Nezha2:gutov:gutov-main:SERIAL",
+            },
+        )
+
+        entries = devices_mod.probe_all(config, clear=True)
+
+        assert [entry["uid"] for entry in entries] == [_DEVICE_UID]
+        saved = devices_mod.load_devices(config)
+        assert set(saved) == {_DEVICE_UID}
+        assert saved[_DEVICE_UID]["device_name"] == "gutov-main"
+
+    def test_probe_shows_device_name(self, monkeypatch, capsys, tmp_path):
+        config = tmp_path / "devices.json"
+        registry = {_DEVICE_UID: _DEVICE_ENTRY.copy()}
+
+        monkeypatch.setattr(
+            devices_mod,
+            "probe_all",
+            lambda _path, clear=False: [registry[_DEVICE_UID]],
+        )
+
+        from mbdeploy.cli import _cmd_probe
+
+        rc = _cmd_probe(argparse.Namespace(config=str(config)))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "DEVICE NAME" in out
+        assert "gutov-main" in out
 
 
 # ---------------------------------------------------------------------------

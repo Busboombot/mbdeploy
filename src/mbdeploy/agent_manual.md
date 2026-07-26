@@ -54,7 +54,7 @@ subcommand.
 | `build`    | Compile the micro:bit firmware. |
 | `deploy`   | Flash firmware to a micro:bit device. |
 | `list`     | List detected devices (fast; uses the saved registry for names). |
-| `probe`    | Actively probe every connected device and update the registry. |
+| `probe`    | Actively probe every connected device and update the registry. Use `--clear` to rebuild it from live devices only. |
 
 ---
 
@@ -72,8 +72,8 @@ Each entry is keyed by the board's UID and carries:
 | `enum`        | Small integer assigned once; never reused or changed. |
 | `port`        | `/dev/cu.*` serial port. Refreshed on every `probe`. |
 | `role`        | Device type from its `DEVICE:` announcement (e.g. `Nezha2`, `RADIOBRIDGE`). |
-| `common_name` | Friendly name (preferred for display and addressing). |
-| `device_name` | Secondary name. |
+| `common_name` | Friendly name used for `deploy` target resolution. |
+| `device_name` | Friendly name shown by `list` and `probe`. |
 | `serial`      | Serial reported in the announcement. |
 
 Registry invariants worth knowing as an agent:
@@ -99,8 +99,7 @@ resolved in this precedence order:
 2. **Contains `/`** (e.g. starts with `/dev/`) → matched against `port`.
    Example: `/dev/cu.usbmodem1234`
 3. **40–52 hex chars** → matched against `uid`.
-4. **Anything else** → case-insensitive match on `common_name`, then
-   `device_name`. Example: `gutov`
+4. **Anything else** → case-insensitive match on `common_name`. Example: `gutov`
 
 If `target` is omitted, `mbdeploy` **auto-picks** the unique non-relay
 device in the registry. If there are zero or more than one non-relay
@@ -139,6 +138,13 @@ mbdeploy list
 
 `probe` opens each serial port and updates names/ports; `list` is a fast
 read of the saved registry merged with the current live probes.
+
+If you want to discard stale registry entries and rebuild from the currently
+connected devices only, run:
+
+```bash
+mbdeploy probe --clear
+```
 
 ### 6.2 Build, then deploy to the only robot
 

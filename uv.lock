@@ -303,7 +303,7 @@ wheels = [
 
 [[package]]
 name = "mbdeploy"
-version = "0.20260620.6"
+version = "0.20260725.1"
 source = { editable = "." }
 dependencies = [
     { name = "pyocd" },

@@ -82,7 +82,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         return 0
 
     # Build display rows: merge live probe info with registry annotation
-    print(f"{'ENUM':<6} {'UID':<44} {'PORT':<26} {'ROLE':<16} {'NAME'}")
+    print(f"{'ENUM':<6} {'UID':<44} {'PORT':<26} {'ROLE':<16} {'DEVICE NAME'}")
     print("-" * 110)
     for probe in probes:
         uid = probe["uid"]
@@ -90,7 +90,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         entry = registry.get(uid, {})
         enum_val = str(entry.get("enum", ""))
         role = entry.get("role", "")
-        name = entry.get("common_name") or entry.get("device_name") or ""
+        name = entry.get("device_name") or entry.get("common_name") or ""
         print(f"{enum_val:<6} {uid:<44} {port:<26} {role:<16} {name}")
 
     return 0
@@ -101,20 +101,20 @@ def _cmd_probe(args: argparse.Namespace) -> int:
 
     config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
 
-    entries = devices_mod.probe_all(config_path)
+    entries = devices_mod.probe_all(config_path, clear=getattr(args, "clear", False))
 
     if not entries:
         print("no devices found")
         return 0
 
-    print(f"{'ENUM':<6} {'UID':<44} {'PORT':<26} {'ROLE':<16} {'NAME'}")
+    print(f"{'ENUM':<6} {'UID':<44} {'PORT':<26} {'ROLE':<16} {'DEVICE NAME'}")
     print("-" * 110)
     for entry in entries:
         enum_val = str(entry.get("enum", ""))
         uid = entry.get("uid", "")
         port = entry.get("port") or ""
         role = entry.get("role") or ""
-        name = entry.get("common_name") or entry.get("device_name") or ""
+        name = entry.get("device_name") or entry.get("common_name") or ""
         print(f"{enum_val:<6} {uid:<44} {port:<26} {role:<16} {name}")
 
     return 0
@@ -321,6 +321,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Probe connected micro:bit devices and update the registry.",
     )
     probe_p.add_argument("--config", metavar="PATH", help="Path to device config file.")
+    probe_p.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear the registry before probing, keeping only currently connected devices.",
+    )
     probe_p.set_defaults(func=_cmd_probe)
 
     return parser
