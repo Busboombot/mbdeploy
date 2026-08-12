@@ -13,7 +13,9 @@ Registry invariants
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -27,8 +29,24 @@ except Exception:  # pragma: no cover
 
 BAUD_RATE = 115200
 
+DEFAULT_MCU = "nrf52833"
+
+#: nRF5x ``FICR.DEVICEID[1]`` — the 32-bit word the micro:bit runtime hashes
+#: into the board's five-letter friendly name.
+FICR_DEVICEID1 = 0x10000064
+
 _IOREG_SERIAL_RE = re.compile(r'"USB Serial Number"\s*=\s*"([^"]+)"')
 _IOREG_CALLOUT_RE = re.compile(r'"IOCalloutDevice"\s*=\s*"([^"]+)"')
+
+#: CODAL's friendly-name codebook: five base-5 digits, alternating
+#: consonants and vowels, most-significant digit first in the printed name.
+_NAME_CODEBOOK = (
+    ("z", "v", "g", "p", "t"),
+    ("u", "o", "i", "e", "a"),
+    ("z", "v", "g", "p", "t"),
+    ("u", "o", "i", "e", "a"),
+    ("z", "v", "g", "p", "t"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +165,78 @@ def probe_type(port: str, timeout_s: float = 1.6) -> dict[str, str] | None:
             ser.close()
 
 
+def friendly_name(device_id: int) -> str:
+    """Return the micro:bit five-letter name encoded by ``FICR.DEVICEID[1]``.
+
+    This is CODAL's ``microbit_friendly_name()``: the 32-bit word is written
+    out as five base-5 digits, and digit *i* (counting from the least
+    significant) selects a letter from column *i* of the codebook, landing at
+    position ``4 - i`` of the name.  Example: ``2314287040 -> "tovez"``.
+    """
+    n = device_id & 0xFFFFFFFF
+    letters = [""] * 5
+    for i in range(5):
+        letters[4 - i] = _NAME_CODEBOOK[i][n % 5]
+        n //= 5
+    return "".join(letters)
+
+
+@contextlib.contextmanager
+def _quiet_pyocd():
+    """Silence pyOCD's logging so it can't interleave with table output."""
+    logger = logging.getLogger("pyocd")
+    previous = logger.level
+    logger.setLevel(logging.CRITICAL + 1)
+    try:
+        yield
+    finally:
+        logger.setLevel(previous)
+
+
+def read_device_id(uid: str, target_mcu: str = DEFAULT_MCU) -> int | None:
+    """Read ``FICR.DEVICEID[1]`` from the board behind ``uid`` over SWD.
+
+    The board's name is a property of the *target* nRF, not of the debug
+    probe, so it cannot be computed from ``uid`` alone — but it can be read
+    through the probe the UID names.  Attaches without halting or resetting,
+    and needs no serial port and no cooperating firmware.
+
+    Returns ``None`` if pyOCD is unavailable, the probe is busy (e.g. mid
+    flash), or the target refuses the connection (locked part).
+    """
+    try:
+        from pyocd.core.helpers import ConnectHelper  # type: ignore
+    except Exception:  # pragma: no cover - pyocd is a declared dependency
+        return None
+    # DEVICEID lives at the same address on nRF51 and nRF52, so the retry
+    # without an override lets pyOCD auto-detect a board (a V1 micro:bit)
+    # that the caller's target guess doesn't fit.
+    for override in (target_mcu, None):
+        try:
+            with _quiet_pyocd():
+                with ConnectHelper.session_with_chosen_probe(
+                    unique_id=uid,
+                    target_override=override,
+                    connect_mode="attach",
+                    blocking=False,
+                    auto_unlock=False,
+                ) as session:
+                    return session.target.read32(FICR_DEVICEID1)
+        except Exception:
+            continue
+    return None
+
+
+def read_board_name(uid: str, target_mcu: str = DEFAULT_MCU) -> str | None:
+    """Return the five-letter micro:bit name of the board behind ``uid``.
+
+    Convenience wrapper over :func:`read_device_id` + :func:`friendly_name`;
+    ``None`` when the device id could not be read.
+    """
+    device_id = read_device_id(uid, target_mcu)
+    return friendly_name(device_id) if device_id is not None else None
+
+
 def is_relay(role: str | None) -> bool:
     """True if a DEVICE: role/type names a radio relay/bridge.
 
@@ -188,7 +278,14 @@ def assign_enum(devices: dict[str, dict], uid: str) -> int:
     return max(existing, default=0) + 1
 
 
-def probe_all(config_path: Path, clear: bool = False) -> list[dict]:
+def connected_uids() -> set[str]:
+    """Return the UID of every micro:bit currently attached over USB."""
+    return {p["uid"] for p in flashable_probes()}
+
+
+def probe_all(
+    config_path: Path, clear: bool = False, target_mcu: str = DEFAULT_MCU
+) -> list[dict]:
     """Discover all connected probes, probe each port, update and save the registry.
 
     Merge logic
@@ -196,6 +293,8 @@ def probe_all(config_path: Path, clear: bool = False) -> list[dict]:
     - ``port`` is always refreshed from ``port_serial_map()``.
     - If ``probe_type`` returns a result, announcement fields are updated.
     - If ``probe_type`` returns None, existing announcement fields are kept.
+    - A board that has never yielded a ``board_name`` gets one read over SWD,
+      so silent and unflashed boards are still identifiable by name.
     - Boards with no serial port get an entry with ``port: null``.
     - Entries are never deleted.
 
@@ -222,6 +321,11 @@ def probe_all(config_path: Path, clear: bool = False) -> list[dict]:
             entry["device_name"]  = info["device_name"]
             entry["serial"]       = info["serial"]
         # else: preserve existing announcement fields unchanged
+        if not entry.get("board_name"):
+            device_id = read_device_id(uid, target_mcu)
+            if device_id is not None:
+                entry["device_id"] = device_id
+                entry["board_name"] = friendly_name(device_id)
         devices[uid] = entry
 
     save_devices(devices, config_path)
@@ -236,7 +340,9 @@ def resolve_target(token: str, devices: dict[str, dict]) -> dict:
     1. Pure digits → match by ``enum`` field.
     2. Starts with ``/dev/`` or contains ``/`` → match by ``port`` field.
     3. 40–52 hex characters → match by ``uid`` field.
-    4. Otherwise → case-insensitive match on ``common_name``.
+    4. Otherwise → case-insensitive match on ``common_name``, falling back to
+       the five-letter ``board_name`` that ``list`` shows for boards with no
+       announcement of their own.
 
     Raises ``ValueError`` with a descriptive message if no match is found.
     """
@@ -262,9 +368,10 @@ def resolve_target(token: str, devices: dict[str, dict]) -> dict:
                 return entry
         raise ValueError(f"No device found with uid '{token}'")
 
-    # 4. Name (common_name, case-insensitive)
+    # 4. Name (common_name, case-insensitive), then hardware board name
     token_lower = token.lower()
-    for entry in devices.values():
-        if entry.get("common_name", "").lower() == token_lower:
-            return entry
+    for field in ("common_name", "board_name"):
+        for entry in devices.values():
+            if (entry.get(field) or "").lower() == token_lower:
+                return entry
     raise ValueError(f"No device found matching '{token}'")

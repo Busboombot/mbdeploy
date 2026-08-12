@@ -68,31 +68,85 @@ def _cmd_build(args: argparse.Namespace) -> int:
     )
 
 
+_ROW_FMT = (
+    "{enum:<5} {conn:<5} {name:<12} {common:<12} {role:<13} {port:<24} {uid}"
+)
+_TABLE_HEADER = _ROW_FMT.format(
+    enum="ENUM", conn="CONN", name="DEVICE NAME", common="COMMON NAME",
+    role="ROLE", port="PORT", uid="UID",
+)
+
+
+def _print_device_table(rows: list[dict]) -> None:
+    """Print the shared `list` / `probe` table, connected devices first."""
+    print(_TABLE_HEADER)
+    print("-" * len(_TABLE_HEADER))
+    for row in rows:
+        print(_ROW_FMT.format(**row))
+
+
+def _device_rows(
+    entries: dict[str, dict],
+    live_uids: set[str],
+    live_ports: dict[str, str],
+    read_names: bool,
+    target_mcu: str,
+) -> list[dict]:
+    """Merge registry entries with the live probe list into display rows.
+
+    Every known board appears — connected or not — and a connected board with
+    no recorded name has its five-letter micro:bit name read over SWD, so a
+    board that has never been probed still shows up identifiably.
+    """
+    import mbdeploy.devices as devices_mod
+
+    uids = list(entries) + [uid for uid in live_uids if uid not in entries]
+    rows = []
+    for uid in uids:
+        entry = entries.get(uid, {})
+        connected = uid in live_uids
+        name = entry.get("device_name") or entry.get("board_name") or ""
+        if not name and connected and read_names:
+            name = devices_mod.read_board_name(uid, target_mcu) or ""
+        rows.append({
+            "enum": str(entry.get("enum", "")),
+            "conn": "yes" if connected else "no",
+            "name": name,
+            "common": entry.get("common_name") or "",
+            "role": entry.get("role") or "",
+            # A remembered port is meaningless once the board is unplugged.
+            "port": (live_ports.get(uid) or entry.get("port") or "") if connected else "",
+            "uid": uid,
+        })
+    # Connected first, then by enum (unregistered boards last), then by UID.
+    rows.sort(key=lambda r: (
+        r["conn"] == "no",
+        int(r["enum"]) if r["enum"] else 1 << 30,
+        r["uid"],
+    ))
+    return rows
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     import mbdeploy.devices as devices_mod
 
     config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
 
     probes = devices_mod.flashable_probes()
-    ports = devices_mod.port_serial_map({p["uid"] for p in probes}) if probes else {}
+    live_uids = {p["uid"] for p in probes}
+    ports = devices_mod.port_serial_map(live_uids) if probes else {}
     registry = devices_mod.load_devices(config_path)
 
-    if not probes:
+    rows = _device_rows(
+        registry, live_uids, ports,
+        read_names=not getattr(args, "fast", False),
+        target_mcu=getattr(args, "target_mcu", None) or _DEFAULT_MCU,
+    )
+    if not rows:
         print("no devices found")
         return 0
 
-    # Build display rows: merge live probe info with registry annotation
-    print(f"{'ENUM':<6} {'UID':<44} {'PORT':<26} {'ROLE':<16} {'DEVICE NAME'}")
-    print("-" * 110)
-    for probe in probes:
-        uid = probe["uid"]
-        port = ports.get(uid, "")
-        entry = registry.get(uid, {})
-        enum_val = str(entry.get("enum", ""))
-        role = entry.get("role", "")
-        name = entry.get("device_name") or entry.get("common_name") or ""
-        print(f"{enum_val:<6} {uid:<44} {port:<26} {role:<16} {name}")
-
+    _print_device_table(rows)
     return 0
 
 
@@ -101,22 +155,26 @@ def _cmd_probe(args: argparse.Namespace) -> int:
 
     config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
 
-    entries = devices_mod.probe_all(config_path, clear=getattr(args, "clear", False))
+    target_mcu = getattr(args, "target_mcu", None) or _DEFAULT_MCU
+    entries = devices_mod.probe_all(
+        config_path,
+        clear=getattr(args, "clear", False),
+        target_mcu=target_mcu,
+    )
 
     if not entries:
         print("no devices found")
         return 0
 
-    print(f"{'ENUM':<6} {'UID':<44} {'PORT':<26} {'ROLE':<16} {'DEVICE NAME'}")
-    print("-" * 110)
-    for entry in entries:
-        enum_val = str(entry.get("enum", ""))
-        uid = entry.get("uid", "")
-        port = entry.get("port") or ""
-        role = entry.get("role") or ""
-        name = entry.get("device_name") or entry.get("common_name") or ""
-        print(f"{enum_val:<6} {uid:<44} {port:<26} {role:<16} {name}")
-
+    registry = {entry["uid"]: entry for entry in entries if entry.get("uid")}
+    rows = _device_rows(
+        registry,
+        devices_mod.connected_uids(),
+        {},                       # probe_all already refreshed each entry's port
+        read_names=False,         # probe_all already read every missing name
+        target_mcu=target_mcu,
+    )
+    _print_device_table(rows)
     return 0
 
 
@@ -313,6 +371,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="List detected micro:bit devices.",
     )
     list_p.add_argument("--config", metavar="PATH", help="Path to device config file.")
+    list_p.add_argument(
+        "--fast",
+        action="store_true",
+        help="Skip reading board names over SWD for devices missing from the registry.",
+    )
+    list_p.add_argument(
+        "--target-mcu",
+        metavar="MCU",
+        dest="target_mcu",
+        default=_DEFAULT_MCU,
+        help=f"Target MCU type used when reading board names (default: {_DEFAULT_MCU}).",
+    )
     list_p.set_defaults(func=_cmd_list)
 
     # --- probe ---
@@ -321,6 +391,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Probe connected micro:bit devices and update the registry.",
     )
     probe_p.add_argument("--config", metavar="PATH", help="Path to device config file.")
+    probe_p.add_argument(
+        "--target-mcu",
+        metavar="MCU",
+        dest="target_mcu",
+        default=_DEFAULT_MCU,
+        help=f"Target MCU type used when reading board names (default: {_DEFAULT_MCU}).",
+    )
     probe_p.add_argument(
         "--clear",
         action="store_true",

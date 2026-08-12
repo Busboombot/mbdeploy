@@ -138,6 +138,19 @@ class TestResolveTarget:
         with pytest.raises(ValueError, match="No device found"):
             resolve_target("relay1", self._registry())
 
+    def test_resolve_by_board_name(self):
+        """The five-letter name list shows is usable as a deploy target."""
+        registry = self._registry()
+        registry[_DEVICE2_UID] = {**_DEVICE2_ENTRY, "common_name": "", "board_name": "tovez"}
+        result = resolve_target("TOVEZ", registry)
+        assert result["uid"] == _DEVICE2_UID
+
+    def test_common_name_wins_over_board_name(self):
+        registry = self._registry()
+        registry[_DEVICE_UID]["board_name"] = "alpha"
+        registry[_DEVICE2_UID] = {**_DEVICE2_ENTRY, "common_name": "alpha"}
+        assert resolve_target("alpha", registry)["uid"] == _DEVICE2_UID
+
     def test_resolve_unknown_raises(self):
         with pytest.raises(ValueError, match="No device found"):
             resolve_target("nonexistent", self._registry())
@@ -221,6 +234,173 @@ class TestDisplayNames:
         assert "gutov\n" not in out
 
 
+class TestFriendlyName:
+    """The five-letter name CODAL derives from FICR.DEVICEID[1]."""
+
+    def test_known_board(self):
+        """Ground truth from a real board: DEVICEID[1] 2314287040 announces 'tovez'."""
+        assert devices_mod.friendly_name(2314287040) == "tovez"
+
+    def test_more_known_boards(self):
+        # Read over SWD from three micro:bit V2 boards.
+        assert devices_mod.friendly_name(2175407711) == "gopiv"
+        assert devices_mod.friendly_name(1784514240) == "getez"
+        assert devices_mod.friendly_name(1198504156) == "vevov"
+
+    def test_name_is_always_five_letters(self):
+        for device_id in (0, 1, 0xFFFFFFFF, 123456789):
+            name = devices_mod.friendly_name(device_id)
+            assert len(name) == 5
+            assert name.isalpha()
+
+    def test_zero_is_the_lowest_name(self):
+        assert devices_mod.friendly_name(0) == "zuzuz"
+
+    def test_read_board_name_returns_none_when_id_unreadable(self, monkeypatch):
+        monkeypatch.setattr(devices_mod, "read_device_id", lambda uid, mcu: None)
+        assert devices_mod.read_board_name(_DEVICE_UID, "nrf52833") is None
+
+
+class TestConnectedColumn:
+    """list shows every known board and whether it is plugged in."""
+
+    def _run_list(self, monkeypatch, capsys, registry, live):
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [{"uid": uid, "description": ""} for uid in live],
+        )
+        monkeypatch.setattr(devices_mod, "port_serial_map", lambda known: {})
+        monkeypatch.setattr(devices_mod, "load_devices", lambda _path: registry)
+
+        from mbdeploy.cli import _cmd_list
+
+        rc = _cmd_list(argparse.Namespace(config=None, fast=True, target_mcu="nrf52833"))
+        assert rc == 0
+        return capsys.readouterr().out
+
+    def test_disconnected_registry_entry_is_listed(self, monkeypatch, capsys):
+        """A registered board that is unplugged still appears, marked 'no'."""
+        out = self._run_list(
+            monkeypatch, capsys, {_DEVICE_UID: _DEVICE_ENTRY.copy()}, live=[]
+        )
+        assert "CONN" in out
+        row = next(line for line in out.splitlines() if _DEVICE_UID in line)
+        assert " no " in row
+        assert "gutov-main" in row
+
+    def test_connected_entry_is_marked_yes(self, monkeypatch, capsys):
+        out = self._run_list(
+            monkeypatch, capsys, {_DEVICE_UID: _DEVICE_ENTRY.copy()}, live=[_DEVICE_UID]
+        )
+        row = next(line for line in out.splitlines() if _DEVICE_UID in line)
+        assert " yes " in row
+
+    def test_stale_port_is_hidden_for_disconnected_board(self, monkeypatch, capsys):
+        """The remembered port is meaningless once the board is unplugged."""
+        out = self._run_list(
+            monkeypatch, capsys, {_DEVICE_UID: _DEVICE_ENTRY.copy()}, live=[]
+        )
+        assert "/dev/cu.device1" not in out
+
+    def test_connected_boards_sort_before_disconnected(self, monkeypatch, capsys):
+        registry = {
+            _DEVICE_UID: _DEVICE_ENTRY.copy(),      # enum 2, unplugged
+            _DEVICE2_UID: _DEVICE2_ENTRY.copy(),    # enum 3, plugged in
+        }
+        out = self._run_list(monkeypatch, capsys, registry, live=[_DEVICE2_UID])
+        assert out.index(_DEVICE2_UID) < out.index(_DEVICE_UID)
+
+    def test_unregistered_board_gets_its_name_read_over_swd(self, monkeypatch, capsys):
+        """A connected board that was never probed still shows a name."""
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [{"uid": _DEVICE2_UID, "description": ""}],
+        )
+        monkeypatch.setattr(devices_mod, "port_serial_map", lambda known: {})
+        monkeypatch.setattr(devices_mod, "load_devices", lambda _path: {})
+        monkeypatch.setattr(devices_mod, "read_board_name", lambda uid, mcu: "tovez")
+
+        from mbdeploy.cli import _cmd_list
+
+        rc = _cmd_list(
+            argparse.Namespace(config=None, fast=False, target_mcu="nrf52833")
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "tovez" in out
+        assert _DEVICE2_UID in out
+
+    def test_fast_skips_the_swd_read(self, monkeypatch, capsys):
+        def _boom(uid, mcu):
+            raise AssertionError("--fast must not touch the debug probe")
+
+        monkeypatch.setattr(devices_mod, "read_board_name", _boom)
+        out = self._run_list(monkeypatch, capsys, {}, live=[_DEVICE2_UID])
+        assert _DEVICE2_UID in out
+
+    def test_no_devices_at_all(self, monkeypatch, capsys):
+        out = self._run_list(monkeypatch, capsys, {}, live=[])
+        assert "no devices found" in out
+
+
+class TestProbeRecordsBoardName:
+    """probe caches the hardware name so later lists are free."""
+
+    def test_board_name_recorded_without_announcement(self, monkeypatch, tmp_path):
+        config = tmp_path / "devices.json"
+
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [{"uid": _DEVICE_UID, "description": "dev"}],
+        )
+        monkeypatch.setattr(devices_mod, "port_serial_map", lambda known: {})
+        monkeypatch.setattr(devices_mod, "probe_type", lambda port: None)
+        monkeypatch.setattr(devices_mod, "read_device_id", lambda uid, mcu: 2314287040)
+
+        entries = devices_mod.probe_all(config)
+
+        assert entries[0]["board_name"] == "tovez"
+        assert entries[0]["device_id"] == 2314287040
+        saved = devices_mod.load_devices(config)
+        assert saved[_DEVICE_UID]["board_name"] == "tovez"
+
+    def test_known_board_name_is_not_re_read(self, monkeypatch, tmp_path):
+        """The name never changes for a UID, so a second probe skips the SWD read."""
+        config = tmp_path / "devices.json"
+        config.write_text(json.dumps({
+            _DEVICE_UID: {"uid": _DEVICE_UID, "enum": 1, "board_name": "tovez"}
+        }))
+
+        def _boom(uid, mcu):
+            raise AssertionError("cached board_name must not be re-read")
+
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [{"uid": _DEVICE_UID, "description": "dev"}],
+        )
+        monkeypatch.setattr(devices_mod, "port_serial_map", lambda known: {})
+        monkeypatch.setattr(devices_mod, "probe_type", lambda port: None)
+        monkeypatch.setattr(devices_mod, "read_device_id", _boom)
+
+        entries = devices_mod.probe_all(config)
+        assert entries[0]["board_name"] == "tovez"
+
+    def test_unreadable_device_id_leaves_entry_intact(self, monkeypatch, tmp_path):
+        config = tmp_path / "devices.json"
+
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [{"uid": _DEVICE_UID, "description": "dev"}],
+        )
+        monkeypatch.setattr(devices_mod, "port_serial_map", lambda known: {})
+        monkeypatch.setattr(devices_mod, "probe_type", lambda port: None)
+        monkeypatch.setattr(devices_mod, "read_device_id", lambda uid, mcu: None)
+
+        entries = devices_mod.probe_all(config)
+        assert "board_name" not in entries[0]
+        assert entries[0]["enum"] == 1
+
+
 class TestProbeClear:
     def test_probe_clear_rebuilds_registry_from_live_devices(self, monkeypatch, tmp_path):
         config = tmp_path / "devices.json"
@@ -254,8 +434,9 @@ class TestProbeClear:
         monkeypatch.setattr(
             devices_mod,
             "probe_all",
-            lambda _path, clear=False: [registry[_DEVICE_UID]],
+            lambda _path, clear=False, target_mcu=None: [registry[_DEVICE_UID]],
         )
+        monkeypatch.setattr(devices_mod, "connected_uids", lambda: {_DEVICE_UID})
 
         from mbdeploy.cli import _cmd_probe
 

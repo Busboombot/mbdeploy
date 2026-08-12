@@ -53,8 +53,24 @@ subcommand.
 |------------|---------|
 | `build`    | Compile the micro:bit firmware. |
 | `deploy`   | Flash firmware to a micro:bit device. |
-| `list`     | List detected devices (fast; uses the saved registry for names). |
+| `list`     | List every known device, connected or not, with names from the saved registry. |
 | `probe`    | Actively probe every connected device and update the registry. Use `--clear` to rebuild it from live devices only. |
+
+Both `list` and `probe` print the same table:
+
+```
+ENUM  CONN  DEVICE NAME  COMMON NAME  ROLE          PORT                     UID
+1     yes   tovez        robot        NEZHA2        /dev/cu.usbmodem2121102  99063602...
+2     no    gopiv                                                            99063602...
+```
+
+- `CONN` is `yes` when the board is attached over USB right now, `no` when it is
+  only remembered from an earlier `probe`. Connected boards sort first.
+- `PORT` is blank for a disconnected board — its remembered port no longer exists.
+- `DEVICE NAME` is the board's five-letter micro:bit name (see §3.1).
+- Boards that have never been probed still appear, with their name read live.
+
+`list` accepts `--fast`, which skips that live name read (see §3.1).
 
 ---
 
@@ -75,6 +91,8 @@ Each entry is keyed by the board's UID and carries:
 | `common_name` | Friendly name used for `deploy` target resolution. |
 | `device_name` | Friendly name shown by `list` and `probe`. |
 | `serial`      | Serial reported in the announcement. |
+| `board_name`  | Five-letter micro:bit name read from the hardware (see §3.1). |
+| `device_id`   | The 32-bit `FICR.DEVICEID[1]` that `board_name` encodes. |
 
 Registry invariants worth knowing as an agent:
 
@@ -84,9 +102,31 @@ Registry invariants worth knowing as an agent:
   `common_name`, …) are **preserved** if a probe can't read a fresh
   announcement (port busy, no firmware, timeout).
 - **`enum` is assigned once** and is stable for a given UID.
+- **`board_name` is read once** and never re-read — it is fixed in silicon.
 
 Because of this, `list` is cheap and trustworthy for names, but `port`
 values are only as fresh as the last `probe`.
+
+### 3.1 Board names and the UID
+
+A micro:bit's five-letter name (`tovez`, `gopiv`, …) is derived by its runtime
+from `FICR.DEVICEID[1]` on the **target** nRF, in base 5 over a fixed
+consonant/vowel codebook.
+
+That name **cannot be computed from the UID.** The UID is the USB serial number
+of the separate on-board DAPLink interface chip; the two ids are unrelated. Any
+attempt to slice the name out of the UID string is wrong.
+
+It *can* be read through the probe the UID names: `mbdeploy` attaches with pyOCD
+(`connect_mode="attach"` — no halt, no reset) and reads `DEVICEID[1]`, about
+0.2 s per board. This needs neither a serial port nor cooperating firmware, so a
+blank or freshly unboxed board still reports its name.
+
+- `probe` reads and caches it in `board_name` for every board that lacks one.
+- `list` uses the cached value, and reads live only for connected boards the
+  registry does not know. `list --fast` skips those reads.
+- If the read fails (probe busy mid-flash, locked part), the name is simply
+  blank; nothing else about the entry changes.
 
 ---
 
@@ -99,7 +139,8 @@ resolved in this precedence order:
 2. **Contains `/`** (e.g. starts with `/dev/`) → matched against `port`.
    Example: `/dev/cu.usbmodem1234`
 3. **40–52 hex chars** → matched against `uid`.
-4. **Anything else** → case-insensitive match on `common_name`. Example: `gutov`
+4. **Anything else** → case-insensitive match on `common_name`, then on
+   `board_name`. Examples: `gutov`, `tovez`
 
 If `target` is omitted, `mbdeploy` **auto-picks** the unique non-relay
 device in the registry. If there are zero or more than one non-relay
@@ -136,8 +177,10 @@ mbdeploy probe
 mbdeploy list
 ```
 
-`probe` opens each serial port and updates names/ports; `list` is a fast
-read of the saved registry merged with the current live probes.
+`probe` opens each serial port, updates names/ports, and records the hardware
+board name of anything new; `list` is a fast read of the saved registry merged
+with the current live probes. `list` shows unplugged boards too, marked
+`CONN=no`, so a board missing from your fleet is visible rather than absent.
 
 If you want to discard stale registry entries and rebuild from the currently
 connected devices only, run:
