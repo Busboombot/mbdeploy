@@ -55,6 +55,7 @@ subcommand.
 | `deploy`   | Flash firmware to a micro:bit device. |
 | `list`     | List every known device, connected or not, with names from the saved registry. |
 | `probe`    | Actively probe every connected device and update the registry. Use `--clear` to rebuild it from live devices only. |
+| `connect`  | Open a serial session with a device, or send it one line and print the reply. |
 
 Both `list` and `probe` print the same table:
 
@@ -88,8 +89,8 @@ Each entry is keyed by the board's UID and carries:
 | `enum`        | Small integer assigned once; never reused or changed. |
 | `port`        | `/dev/cu.*` serial port. Refreshed on every `probe`. |
 | `role`        | Device type from its `DEVICE:` announcement (e.g. `Nezha2`, `RADIOBRIDGE`). |
-| `common_name` | Friendly name used for `deploy` target resolution. |
-| `device_name` | Friendly name shown by `list` and `probe`. |
+| `common_name` | Human label for the board's role in a classroom ("Jane's robot"). Shown by `list`; **never** matched as a target. |
+| `device_name` | The board's own five-letter name, from its `DEVICE:` announcement. A target. |
 | `serial`      | Serial reported in the announcement. |
 | `board_name`  | Five-letter micro:bit name read from the hardware (see §3.1). |
 | `device_id`   | The 32-bit `FICR.DEVICEID[1]` that `board_name` encodes. |
@@ -136,15 +137,53 @@ The `deploy` subcommand takes an optional positional `target`. It is
 resolved in this precedence order:
 
 1. **All digits** → matched against `enum`. Example: `2`
-2. **Contains `/`** (e.g. starts with `/dev/`) → matched against `port`.
-   Example: `/dev/cu.usbmodem1234`
+2. **Contains `/`** (e.g. starts with `/dev/`) → matched against the **live**
+   `ioreg` port map: whichever board is on that path *right now* is the one
+   flashed. Example: `/dev/cu.usbmodem1234`
 3. **40–52 hex chars** → matched against `uid`.
-4. **Anything else** → case-insensitive match on `common_name`, then on
-   `board_name`. Examples: `gutov`, `tovez`
+4. **Anything else** → case-insensitive match on the board's own five-letter
+   name: `device_name` (announced) then `board_name` (read from silicon).
+   Example: `tovez`
+
+Step 2 is deliberately **not** a registry lookup. The registry's `port` is only
+as fresh as the last `probe`, and macOS re-issues `/dev/cu.usbmodem*` names on
+every reconnect, so two boards routinely swap paths. Matching the recorded port
+and then flashing that entry's UID would write firmware to a *different*,
+connected board than the path names. `deploy` therefore resolves the path
+live and refuses rather than guessing when it cannot:
+
+- The board on the path must already be in the registry — its entry is where
+  `role` comes from, and `role` is what the relay guard reads. Run `probe` once
+  for a board `deploy` has never seen.
+- If no micro:bit is on that path, `deploy` errors and lists the ports that are
+  occupied.
+- If the live map is unavailable (it is read from macOS `ioreg`), `deploy`
+  errors rather than falling back to the recorded port. Target by enum, name,
+  or UID on other platforms.
+
+A board is addressed by its **own** name — the five-letter word (`tovez`,
+`gopiv`) its runtime derives from `FICR.DEVICEID[1]`, shown in the DEVICE NAME
+column of `list`. A `common_name` is **never** a target. That field is a human
+label for the board's role in a classroom ("Jane's robot"), assigned by whoever
+set the fleet up: two boards can wear the same one, it changes when a class is
+reassigned, and it says nothing about which hardware is in your hand. `list`
+shows it so you can find a board on a desk; nothing resolves it.
 
 If `target` is omitted, `mbdeploy` **auto-picks** the unique non-relay
 device in the registry. If there are zero or more than one non-relay
 devices, it errors and asks you to be explicit.
+
+`connect` resolves targets the same way, with two deliberate differences:
+
+- Its `target` is **required** — there is no auto-pick.
+- Step 2 needs no lookup at all: an explicit `/dev/...` path is opened
+  verbatim. `connect` wants a port and the path *is* one, so unlike `deploy`
+  — which must translate the path to a UID for pyOCD — it never consults any
+  map, live or recorded. That also means a never-probed board can be reached
+  by path.
+
+For a name, enum, or UID, `connect` re-reads the port live rather than trusting
+the registry, for the same staleness reason.
 
 ---
 
@@ -162,7 +201,16 @@ Common non-zero cases for `deploy`:
 - `pyocd flash` failed *and* the automatic mass-erase recovery also failed
   (see §6.5), or `pyocd reset` returned non-zero.
 
-Error messages are written to **stderr**; normal output goes to stdout.
+Non-zero cases for `connect`:
+
+- Target token matched no registry entry, or the board is not connected.
+- The serial port could not be opened (wrong path, or another program — a
+  serial monitor, an editor's terminal — already has it).
+- A message was sent and **nothing came back** within `--timeout`.
+
+Error messages are written to **stderr**; normal output goes to stdout. For
+`connect` that split matters: the board's reply is the only thing on stdout, so
+`mbdeploy connect tovez STATUS` can be piped or captured directly.
 
 ---
 
@@ -272,6 +320,61 @@ mbdeploy probe  --config /path/to/devices.json
 mbdeploy deploy 2 --config /path/to/devices.json
 ```
 
+### 6.9 Talk to a board over serial
+
+Send one line and read the answer:
+
+```bash
+mbdeploy connect tovez "HELLO"
+```
+
+Everything after the target is joined with spaces and sent as a single
+newline-terminated line, so quoting is optional:
+
+```bash
+mbdeploy connect tovez SET SPEED 50      # sends "SET SPEED 50\n"
+```
+
+Options may appear anywhere, including between the target and the message:
+
+```bash
+mbdeploy connect tovez --baud 9600 "HELLO"
+mbdeploy connect tovez "HELLO" --timeout 5
+```
+
+Omit the message for an interactive session — stdin goes to the board, the
+board's output to stdout, until Ctrl-D or Ctrl-C:
+
+```bash
+mbdeploy connect tovez
+```
+
+Connecting holds DTR low, so opening the port does **not** reset the board;
+whatever it was doing keeps running.
+
+#### How the reply is bounded
+
+`--timeout` (default 2 s) is the budget for the *whole* exchange, not a
+per-read timeout:
+
+- The board has that long to say anything at all.
+- Once it has answered and then stayed quiet for ~0.4 s, the read stops early,
+  so a multi-line reply is returned whole without waiting out the timeout.
+- A board that streams continuously (telemetry, an `ack` loop) is cut off at
+  `--timeout` rather than hanging the command. Raise `--timeout` for a board
+  that is slow to answer; that same flag caps how much of a chatty board's
+  stream you capture.
+
+#### Agent notes
+
+- **Check the exit code, not the text.** A board that answered exits 0; silence
+  within the timeout exits 1.
+- **One port, one owner.** A serial port cannot be shared. `connect` fails if a
+  monitor already holds it, and while `connect` is running, `probe` cannot read
+  that board's `DEVICE:` announcement.
+- **Prefer a name or enum over a path** when scripting — ports shift across
+  reconnects. Use a path only when you truly mean that exact port.
+
 ---
 
 ## 7. Build options (`build` and `deploy --build`)
@@ -287,12 +390,18 @@ mbdeploy deploy 2 --config /path/to/devices.json
 
 ## 8. Agent operating tips
 
-- **Probe before deploy** if you have any doubt about which ports are live;
-  `port` in the registry is only as current as the last `probe`.
-- **Prefer `enum` or `common_name`** over `port` when scripting — ports can
-  shift across reconnects, enums and names do not.
+- **Probe before deploy** for any board `mbdeploy` has not seen; the registry
+  entry is what supplies its `role`, and without one `deploy` refuses a path
+  target rather than flash a board it cannot relay-check.
+- **Prefer `enum` or the five-letter device name** over a port path when scripting — ports
+  shift across reconnects, enums and names do not. A path is resolved against
+  the live map, so it is never *wrong*, but it may name a different board than
+  it did an hour ago.
 - **Trust the exit code.** Don't infer success from stdout text.
 - **Never reflash a relay implicitly.** If you intend to, say so explicitly
   with `--force-relay`; otherwise let the guard protect the gateway.
 - **Disambiguate.** If auto-pick errors as "ambiguous", pass an explicit
   target rather than retrying the bare command.
+- **Use `connect` to check firmware, not `probe`.** `probe` rewrites the
+  registry; `connect` only reads. To confirm a board is alive after a deploy,
+  `mbdeploy connect <target> HELLO` and check the exit code.

@@ -11,7 +11,17 @@ it a stable enumeration number (1..N); `list` and `probe` show every known board
 with a `CONN` column saying whether it is plugged in right now, while `deploy`
 targets a specific known device by enum number, name, serial path, or UID and
 refuses to flash a board recorded as the radio relay unless `--force-relay` is
-given.
+given. A `/dev/…` path is resolved against the **live** `ioreg` mapping — the
+board on that port right now — never against the registry's remembered `port`,
+which goes stale as macOS renames ports across reconnects.
+
+## Addressing a board
+
+A board is addressed by its **own** five-letter name (`tovez`, `gopiv`), by its
+enum number, by UID, or by `/dev/` path. The `COMMON NAME` column — "robot",
+"Jane's robot" — is a human label for the board's role, shown so you can find a
+board on a desk. It is never a target: two boards can share one, and it changes
+when a class is reassigned.
 
 ## Board names
 
@@ -61,8 +71,33 @@ paths are CWD-relative, with `--config` / `--hex` / `--build-cmd` overrides.
 | `deploy`   | Flash firmware to one or more micro:bit devices. |
 | `list`     | List all known micro:bit devices and whether each is connected. Use `--fast` to skip reading names over SWD. |
 | `probe`    | Probe all connected devices and update the registry. Use `--clear` to rebuild it from live devices only. |
+| `connect`  | Open a serial connection to a board, or send it one line and print the reply. |
 
 Run `mbdeploy --help` or `mbdeploy <subcommand> --help` for full usage.
+
+## Talking to a board
+
+`connect` opens the board's serial port — at 115200 baud unless `--baud` says
+otherwise — and either hands it to you interactively or runs a single exchange:
+
+```bash
+mbdeploy connect tovez                      # interactive; Ctrl-D or Ctrl-C to exit
+mbdeploy connect tovez "HELLO"              # send one line, print the reply, exit
+mbdeploy connect tovez --baud 9600 "HELLO"  # same, at 9600 baud
+```
+
+Anything after the target is joined with spaces, sent as one newline-terminated
+line, and the board's answer is printed to stdout. The reply is complete once
+the board falls quiet, and the whole exchange is capped by `--timeout` (2 s by
+default), so a board that streams telemetry can't hang the command. Exit status
+is 0 when the board answered and 1 when it said nothing, so a script can just
+check the exit code.
+
+The reply goes to stdout and every status line to stderr, so
+`mbdeploy connect tovez STATUS` pipes cleanly. Boards are addressed the same way
+as with `deploy` — enum, name, or UID — plus a raw `/dev/cu.*` path, which is
+opened verbatim and so works even for a board that has never been probed.
+Connecting holds DTR low, so it does not reset the board.
 
 ## Top-level flags
 

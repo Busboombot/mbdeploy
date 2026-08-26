@@ -118,37 +118,64 @@ class TestResolveTarget:
         result = resolve_target("2", self._registry())
         assert result["uid"] == _DEVICE_UID
 
-    def test_resolve_by_port(self):
-        """Port-like token (contains '/') matches by port field."""
-        result = resolve_target("/dev/cu.relay1", self._registry())
-        assert result["uid"] == _RELAY_UID
+    def test_port_path_is_refused(self):
+        """A port path is never matched against the registry's recorded port.
+
+        The recorded port goes stale the moment macOS renumbers the USB
+        modem devices, so a match here would hand the caller the board that
+        *used* to be on that path.  Callers that take a path resolve it
+        themselves against the live mapping.
+        """
+        with pytest.raises(ValueError, match="port path"):
+            resolve_target("/dev/cu.relay1", self._registry())
 
     def test_resolve_by_uid(self):
         """40-hex-char token matches by uid field."""
         result = resolve_target(_DEVICE_UID, self._registry())
         assert result["uid"] == _DEVICE_UID
 
-    def test_resolve_by_common_name(self):
-        """Name token matches case-insensitively on common_name."""
-        result = resolve_target("gutov", self._registry())
+    def test_resolve_by_device_name(self):
+        """The announced five-letter name is a target."""
+        result = resolve_target("gutov-main", self._registry())
         assert result["uid"] == _DEVICE_UID
 
-    def test_resolve_by_device_name_is_not_supported(self):
-        """Deploy target names should resolve via common_name only."""
-        with pytest.raises(ValueError, match="No device found"):
-            resolve_target("relay1", self._registry())
-
     def test_resolve_by_board_name(self):
-        """The five-letter name list shows is usable as a deploy target."""
+        """The five-letter name read from silicon is a target too."""
         registry = self._registry()
-        registry[_DEVICE2_UID] = {**_DEVICE2_ENTRY, "common_name": "", "board_name": "tovez"}
+        registry[_DEVICE2_UID] = {
+            **_DEVICE2_ENTRY, "device_name": "", "board_name": "tovez"
+        }
         result = resolve_target("TOVEZ", registry)
         assert result["uid"] == _DEVICE2_UID
 
-    def test_common_name_wins_over_board_name(self):
+    def test_name_match_is_case_insensitive(self):
+        assert resolve_target("GUTOV-MAIN", self._registry())["uid"] == _DEVICE_UID
+
+    def test_common_name_is_never_a_target(self):
+        """A common_name is a human label for a board — "Jane's robot".
+
+        Whoever set the fleet up assigned it; two boards can wear the same
+        one and it changes when a class is reassigned, so it identifies a
+        role in a classroom, not the hardware in your hand.  `list` shows it;
+        nothing resolves it.
+        """
+        registry = self._registry()
+        assert registry[_DEVICE_UID]["common_name"] == "gutov"
+        with pytest.raises(ValueError, match="No device found"):
+            resolve_target("gutov", registry)
+
+    def test_a_shared_common_name_cannot_silently_pick_a_board(self):
+        """Two boards, one label — exactly what must not resolve to either."""
+        registry = self._registry()
+        registry[_DEVICE2_UID] = {**_DEVICE2_ENTRY, "common_name": "gutov"}
+        with pytest.raises(ValueError, match="No device found"):
+            resolve_target("gutov", registry)
+
+    def test_device_name_wins_over_board_name(self):
+        """Both name the same board; the announced one is checked first."""
         registry = self._registry()
         registry[_DEVICE_UID]["board_name"] = "alpha"
-        registry[_DEVICE2_UID] = {**_DEVICE2_ENTRY, "common_name": "alpha"}
+        registry[_DEVICE2_UID] = {**_DEVICE2_ENTRY, "device_name": "alpha"}
         assert resolve_target("alpha", registry)["uid"] == _DEVICE2_UID
 
     def test_resolve_unknown_raises(self):
@@ -501,6 +528,224 @@ class TestAutoPick:
         assert rc != 0
         captured = capsys.readouterr()
         assert "ambiguous" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# deploy — a port path names the board that is on it *now*
+# ---------------------------------------------------------------------------
+
+class TestDeployPortTarget:
+    """``deploy /dev/...`` must follow the live ioreg map, not the registry.
+
+    The registry's ``port`` is only as fresh as the last ``probe``, and macOS
+    hands out ``/dev/cu.usbmodem*`` names anew on every reconnect, so two
+    boards routinely swap paths.  Trusting the recorded port flashes a
+    different, connected board than the path names.
+    """
+
+    def _setup(self, monkeypatch, registry, live_ports):
+        """Wire up a fake fleet and capture every pyocd command deploy runs."""
+        monkeypatch.setattr(devices_mod, "load_devices", lambda _path: registry)
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [{"uid": uid, "description": "dev"} for uid in live_ports],
+        )
+        monkeypatch.setattr(
+            devices_mod, "port_serial_map", lambda known=None: dict(live_ports)
+        )
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return type("R", (), {"returncode": 0})()
+
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return calls
+
+    @staticmethod
+    def _flashed_uid(calls: list[list[str]]) -> str | None:
+        for cmd in calls:
+            if "flash" in cmd and "--uid" in cmd:
+                return cmd[cmd.index("--uid") + 1]
+        return None
+
+    def test_stale_registry_port_does_not_pick_the_board(
+        self, monkeypatch, tmp_path
+    ):
+        """The core regression guard: the ports in the registry are swapped.
+
+        The registry still records device1 on ``/dev/cu.device1``, but the two
+        boards have since traded paths.  Deploying to ``/dev/cu.device1`` must
+        flash device2 — the board actually on it — not the stale match.
+        """
+        registry = {
+            _DEVICE_UID: _DEVICE_ENTRY.copy(),      # port: /dev/cu.device1
+            _DEVICE2_UID: _DEVICE2_ENTRY.copy(),    # port: /dev/cu.device2
+        }
+        live_ports = {                              # ...but they have swapped
+            _DEVICE_UID: "/dev/cu.device2",
+            _DEVICE2_UID: "/dev/cu.device1",
+        }
+        calls = self._setup(monkeypatch, registry, live_ports)
+
+        args = _make_args(
+            target="/dev/cu.device1", config=str(tmp_path / "devices.json")
+        )
+        rc = _cmd_deploy(args)
+
+        assert rc == 0
+        assert self._flashed_uid(calls) == _DEVICE2_UID
+
+    def test_relay_guard_reads_the_live_board_role(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The role guarding the flash is the live board's, not the stale one's.
+
+        The registry puts the ordinary board on ``/dev/cu.device1``; the relay
+        is there now.  The relay guard must fire.
+        """
+        registry = {
+            _DEVICE_UID: _DEVICE_ENTRY.copy(),      # port: /dev/cu.device1
+            _RELAY_UID: _RELAY_ENTRY.copy(),        # port: /dev/cu.relay1
+        }
+        live_ports = {
+            _DEVICE_UID: "/dev/cu.relay1",
+            _RELAY_UID: "/dev/cu.device1",
+        }
+        calls = self._setup(monkeypatch, registry, live_ports)
+
+        args = _make_args(
+            target="/dev/cu.device1", config=str(tmp_path / "devices.json")
+        )
+        rc = _cmd_deploy(args)
+
+        assert rc != 0
+        assert "relay" in capsys.readouterr().err.lower()
+        assert calls == []                          # nothing was flashed
+
+    def test_unregistered_live_uid_is_refused(self, monkeypatch, tmp_path, capsys):
+        """A board on the path but absent from the registry has no known role.
+
+        Flashing it would mean flashing with no relay guard at all, so deploy
+        refuses and sends the user to ``probe``.
+        """
+        registry = {_DEVICE_UID: _DEVICE_ENTRY.copy()}
+        live_ports = {_DEVICE2_UID: "/dev/cu.device1"}
+        calls = self._setup(monkeypatch, registry, live_ports)
+
+        args = _make_args(
+            target="/dev/cu.device1", config=str(tmp_path / "devices.json")
+        )
+        rc = _cmd_deploy(args)
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert "not in the registry" in err
+        assert "probe" in err
+        assert calls == []
+
+    def test_path_with_no_microbit_on_it_is_refused(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """A path that no connected micro:bit occupies never falls back."""
+        registry = {_DEVICE_UID: _DEVICE_ENTRY.copy()}
+        live_ports = {_DEVICE_UID: "/dev/cu.device9"}
+        calls = self._setup(monkeypatch, registry, live_ports)
+
+        args = _make_args(
+            target="/dev/cu.device1", config=str(tmp_path / "devices.json")
+        )
+        rc = _cmd_deploy(args)
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert "/dev/cu.device1" in err
+        assert calls == []
+
+    def test_no_live_map_is_refused_not_guessed(self, monkeypatch, tmp_path, capsys):
+        """Off macOS the mapping is empty; deploy errors instead of guessing.
+
+        The registry would happily match the recorded port here — that is the
+        pre-existing wrong-board behaviour, so it must not be a fallback.
+        """
+        registry = {_DEVICE_UID: _DEVICE_ENTRY.copy()}
+        monkeypatch.setattr(devices_mod, "load_devices", lambda _path: registry)
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [{"uid": _DEVICE_UID, "description": "dev"}],
+        )
+        monkeypatch.setattr(devices_mod, "port_serial_map", lambda known=None: {})
+
+        calls: list[list[str]] = []
+        import subprocess
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda cmd, **kw: (calls.append(cmd),
+                               type("R", (), {"returncode": 0})())[1],
+        )
+
+        args = _make_args(
+            target="/dev/cu.device1", config=str(tmp_path / "devices.json")
+        )
+        rc = _cmd_deploy(args)
+
+        assert rc != 0
+        assert "ioreg" in capsys.readouterr().err
+        assert calls == []
+
+    def test_no_boards_connected_at_all(self, monkeypatch, tmp_path, capsys):
+        """With nothing plugged in, the path error says so plainly."""
+        registry = {_DEVICE_UID: _DEVICE_ENTRY.copy()}
+        calls = self._setup(monkeypatch, registry, {})
+
+        args = _make_args(
+            target="/dev/cu.device1", config=str(tmp_path / "devices.json")
+        )
+        rc = _cmd_deploy(args)
+
+        assert rc != 0
+        assert "no micro:bit is connected" in capsys.readouterr().err.lower()
+        assert calls == []
+
+    # --- the other resolution paths are untouched by the port fix ---
+
+    def _stale_fleet(self, monkeypatch):
+        """Registry ports deliberately disagree with the live mapping."""
+        registry = {
+            _DEVICE_UID: _DEVICE_ENTRY.copy(),
+            _DEVICE2_UID: _DEVICE2_ENTRY.copy(),
+        }
+        live_ports = {
+            _DEVICE_UID: "/dev/cu.device2",
+            _DEVICE2_UID: "/dev/cu.device1",
+        }
+        return registry, self._setup(monkeypatch, registry, live_ports)
+
+    def test_enum_resolution_is_unchanged(self, monkeypatch, tmp_path):
+        _registry, calls = self._stale_fleet(monkeypatch)
+        rc = _cmd_deploy(
+            _make_args(target="2", config=str(tmp_path / "devices.json"))
+        )
+        assert rc == 0
+        assert self._flashed_uid(calls) == _DEVICE_UID
+
+    def test_uid_resolution_is_unchanged(self, monkeypatch, tmp_path):
+        _registry, calls = self._stale_fleet(monkeypatch)
+        rc = _cmd_deploy(
+            _make_args(target=_DEVICE2_UID, config=str(tmp_path / "devices.json"))
+        )
+        assert rc == 0
+        assert self._flashed_uid(calls) == _DEVICE2_UID
+
+    def test_name_resolution_is_unchanged(self, monkeypatch, tmp_path):
+        _registry, calls = self._stale_fleet(monkeypatch)
+        rc = _cmd_deploy(
+            _make_args(target="alpha-main", config=str(tmp_path / "devices.json"))
+        )
+        assert rc == 0
+        assert self._flashed_uid(calls) == _DEVICE2_UID
 
 
 # ---------------------------------------------------------------------------

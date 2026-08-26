@@ -332,17 +332,46 @@ def probe_all(
     return list(devices.values())
 
 
+#: Name fields ``resolve_target`` matches, in order, for a non-numeric,
+#: non-path, non-UID token.  Both are the board's own five-letter micro:bit
+#: name, reached two ways: ``device_name`` from its ``DEVICE:`` announcement,
+#: ``board_name`` read from silicon over SWD.  They agree when both are known.
+#:
+#: ``common_name`` is deliberately absent.  It is a human label for a board —
+#: "Jane's robot" — assigned by whoever set the fleet up, not an identity the
+#: board carries.  Two boards can wear the same one, it changes when a class
+#: is reassigned, and it says nothing about which hardware is in your hand.
+#: It is shown by ``list`` and never matched as a target.
+NAME_FIELDS = ("device_name", "board_name")
+
+
 def resolve_target(token: str, devices: dict[str, dict]) -> dict:
     """Resolve a user-supplied token to a device entry.
 
     Precedence
     ----------
     1. Pure digits → match by ``enum`` field.
-    2. Starts with ``/dev/`` or contains ``/`` → match by ``port`` field.
+    2. Starts with ``/dev/`` or contains ``/`` → **refused**; see below.
     3. 40–52 hex characters → match by ``uid`` field.
-    4. Otherwise → case-insensitive match on ``common_name``, falling back to
-       the five-letter ``board_name`` that ``list`` shows for boards with no
-       announcement of their own.
+    4. Otherwise → case-insensitive match against :data:`NAME_FIELDS`: the
+       board's own five-letter micro:bit name, from its announcement
+       (``device_name``) or read from silicon (``board_name``).  This is the
+       name the DEVICE NAME column of ``list`` shows.  A ``common_name`` is
+       never matched — see :data:`NAME_FIELDS`.
+
+    Why a port path is refused
+    --------------------------
+    The only port this function could match is the ``port`` recorded in the
+    registry, and that is no fresher than the last :func:`probe_all` — macOS
+    re-issues ``/dev/cu.usbmodem*`` names on every reconnect, so two boards
+    routinely swap paths between probes.  Returning the entry that *used to*
+    sit on a path is worse than returning nothing, because the caller goes on
+    to act on that entry's UID: a different board than the path names.  That
+    was a real wrong-board flash in ``deploy``.
+
+    A caller that accepts a path must therefore resolve it itself: against the
+    live :func:`port_serial_map` when it needs a UID (``deploy``), or by using
+    the path verbatim when it needs a port (``connect``).
 
     Raises ``ValueError`` with a descriptive message if no match is found.
     """
@@ -354,12 +383,14 @@ def resolve_target(token: str, devices: dict[str, dict]) -> dict:
                 return entry
         raise ValueError(f"No device found with enum {target_enum}")
 
-    # 2. Port path
+    # 2. Port path — never matched against the recorded port (see docstring).
     if token.startswith("/dev/") or "/" in token:
-        for entry in devices.values():
-            if entry.get("port") == token:
-                return entry
-        raise ValueError(f"No device found with port '{token}'")
+        raise ValueError(
+            f"'{token}' is a port path and cannot be resolved from the "
+            "registry, whose recorded port may name a different board than "
+            "the one on that path now. Resolve it against the live "
+            "port_serial_map(), or target by enum, name, or UID."
+        )
 
     # 3. UID (40–52 hex chars)
     if re.fullmatch(r"[0-9a-fA-F]{40,52}", token):
@@ -368,9 +399,9 @@ def resolve_target(token: str, devices: dict[str, dict]) -> dict:
                 return entry
         raise ValueError(f"No device found with uid '{token}'")
 
-    # 4. Name (common_name, case-insensitive), then hardware board name
+    # 4. The board's own five-letter name, announced or read from silicon.
     token_lower = token.lower()
-    for field in ("common_name", "board_name"):
+    for field in NAME_FIELDS:
         for entry in devices.values():
             if (entry.get(field) or "").lower() == token_lower:
                 return entry
