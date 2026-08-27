@@ -1,7 +1,7 @@
 ---
 id: '005'
 title: 'server.py: Board/Session model, accept loop, serve_serial, serve_flash'
-status: in-progress
+status: done
 use-cases:
 - SUC-004
 - SUC-005
