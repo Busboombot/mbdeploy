@@ -1,7 +1,7 @@
 ---
 id: '004'
 title: 'cli.py: --remote on connect (network serial session, both paths)'
-status: in-progress
+status: done
 use-cases:
 - SUC-011
 - SUC-013
