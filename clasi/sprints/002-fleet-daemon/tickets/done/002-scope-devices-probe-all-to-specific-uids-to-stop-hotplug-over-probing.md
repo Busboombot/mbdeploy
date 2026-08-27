@@ -1,7 +1,7 @@
 ---
 id: '002'
 title: Scope devices.probe_all to specific UIDs to stop hotplug over-probing
-status: in-progress
+status: done
 use-cases:
 - SUC-003
 depends-on: []
