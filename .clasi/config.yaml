@@ -1,0 +1,12 @@
+design_docs: disabled
+paths:
+  db: .clasi/.clasi.db
+  design: docs/design
+  issues: clasi/issues
+  logs: .clasi/log
+  reflections: clasi/reflections
+  sprints: clasi/sprints
+process: se
+protected_paths:
+- src
+- tests

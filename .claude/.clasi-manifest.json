@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "path": ".claude/skills/architecture-authoring/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/architecture-review/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/auto-approve/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/bootstrap-design/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/close-sprint/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/code-review/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/consolidate-architecture/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/create-tickets/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/dispatch-subagent/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/estimation-rubric/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/execute-sprint/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/generate-documentation/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/gh-import/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/issue/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/oop/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/plan-sprint/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/project-initiation/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/project-knowledge/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/project-status/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/report/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/se/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/self-reflect/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/sprint-review/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/sprint-roadmap/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/systematic-debugging/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/skills/tdd-cycle/SKILL.md",
+      "kind": "skill-alias"
+    },
+    {
+      "path": ".claude/agents/programmer/agent.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": ".claude/agents/programmer/python-code-review.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": ".claude/agents/programmer/systematic-debugging.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": ".claude/agents/programmer/tdd-cycle.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": ".claude/agents/sprint-planner/agent.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": ".claude/agents/sprint-planner/plan-sprint.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": ".claude/agents/sprint-planner/create-tickets.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": ".claude/agents/team-lead/agent.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": ".claude/agents/team-lead/project-status.md",
+      "kind": "agent-file"
+    },
+    {
+      "path": "CLAUDE.md",
+      "kind": "marker-block"
+    },
+    {
+      "path": "AGENTS.md",
+      "kind": "marker-block"
+    },
+    {
+      "path": ".claude/settings.local.json",
+      "kind": "permission",
+      "value": "mcp__clasi__*"
+    },
+    {
+      "path": ".claude/rules/mcp-required.md",
+      "kind": "rule-file"
+    },
+    {
+      "path": ".claude/rules/clasi-artifacts.md",
+      "kind": "rule-file"
+    },
+    {
+      "path": ".claude/rules/source-code.md",
+      "kind": "rule-file"
+    },
+    {
+      "path": ".claude/rules/todo-dir.md",
+      "kind": "rule-file"
+    },
+    {
+      "path": ".claude/rules/git-commits.md",
+      "kind": "rule-file"
+    },
+    {
+      "path": ".claude/rules/tool-call-empty-args.md",
+      "kind": "rule-file"
+    }
+  ]
+}

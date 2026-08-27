@@ -1,0 +1,1 @@
+/Volumes/Proj/proj/RobotProjects/mbdeploy/.agents/skills/auto-approve/SKILL.md

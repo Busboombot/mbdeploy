@@ -1,0 +1,1 @@
+/Volumes/Proj/proj/RobotProjects/mbdeploy/.agents/skills/architecture-authoring/SKILL.md
