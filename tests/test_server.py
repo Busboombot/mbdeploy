@@ -26,6 +26,7 @@ import logging
 import socket
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -76,6 +77,56 @@ class FakeFlash:
             for line in self.log_lines:
                 log(line)
         return self.rc
+
+
+class FakeAdvertiser:
+    """Stand-in for `mdns.Advertiser`: records register/unregister calls
+    and hands back sequential integer handles. No real zeroconf, no real
+    network traffic -- `Supervisor` only ever calls `register`/
+    `unregister` on whatever object it's given, so a fake with the same
+    two methods is a complete substitute for these tests."""
+
+    def __init__(self) -> None:
+        self.registered: dict[int, tuple[str, str, int, dict]] = {}
+        self.register_calls: list[tuple[str, str, int, dict]] = []
+        self.unregister_calls: list[int] = []
+        self._next_handle = 1
+
+    def register(self, name: str, service_type: str, port: int, txt: dict) -> int:
+        handle = self._next_handle
+        self._next_handle += 1
+        self.registered[handle] = (name, service_type, port, txt)
+        self.register_calls.append((name, service_type, port, txt))
+        return handle
+
+    def unregister(self, handle: int) -> None:
+        self.registered.pop(handle, None)
+        self.unregister_calls.append(handle)
+
+
+def make_fake_probe_all(entries_by_uid: dict[str, dict], calls: list[dict]):
+    """Build a `devices.probe_all`-shaped stand-in.
+
+    Records every call's kwargs (so a test can assert exactly what
+    `only_uids` a `Supervisor` arrival passed) and returns entries drawn
+    from `entries_by_uid`, narrowed to `only_uids` the same way the real
+    `probe_all` narrows to a scoped set -- never touching (or returning)
+    an entry for any other UID.
+    """
+
+    def _fake_probe_all(config_path, target_mcu="nrf52833", only_uids=None, clear=False):
+        calls.append(
+            {
+                "config_path": config_path,
+                "target_mcu": target_mcu,
+                "only_uids": only_uids,
+                "clear": clear,
+            }
+        )
+        uids = set(entries_by_uid) if only_uids is None else only_uids
+        return [dict(entries_by_uid[u]) for u in uids if u in entries_by_uid]
+
+    return _fake_probe_all
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +182,55 @@ def accept_loop():
     finally:
         loop.close()
         thread.join(timeout=2.0)
+
+
+@pytest.fixture
+def make_supervisor(monkeypatch):
+    """Factory fixture: `make_supervisor(entries_by_uid, **kwargs)` builds
+    a `Supervisor` wired to a fake `devices.probe_all` and a fresh
+    `FakeAdvertiser`, and returns `(supervisor, advertiser, calls)`.
+
+    `_tick`/`_on_arrival`/`_on_departure` never start the accept loop's
+    own thread (its `run()` is never called here) -- `register()`/
+    `unregister()` work fine against a bare, unstarted `AcceptLoop`, and
+    not spinning one up keeps every test in this fixture's family
+    thread-free and sub-millisecond, per the ticket's own testing plan
+    (no sleeping, no hardware). Every listener socket any test bound is
+    closed on teardown so ephemeral loopback sockets never leak across
+    the run.
+    """
+    built: list[tuple[server_mod.Supervisor, server_mod.AcceptLoop]] = []
+
+    def _make(entries_by_uid, *, calls=None, base_port=0, advertiser=None, **kwargs):
+        if calls is None:
+            calls = []
+        monkeypatch.setattr(
+            server_mod.devices, "probe_all", make_fake_probe_all(entries_by_uid, calls)
+        )
+        adv = advertiser if advertiser is not None else FakeAdvertiser()
+        loop = server_mod.AcceptLoop()
+        sup = server_mod.Supervisor(
+            accept_loop=loop,
+            advertiser=adv,
+            config_path=Path("/fake/config.json"),
+            base_port=base_port,
+            bind="127.0.0.1",
+            **kwargs,
+        )
+        built.append((sup, loop))
+        return sup, adv, calls
+
+    yield _make
+
+    for sup, loop in built:
+        for board in sup.boards.values():
+            for sock in (board.serial_listener, board.flash_listener):
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        loop.selector.close()
 
 
 # ---------------------------------------------------------------------------
@@ -779,3 +879,187 @@ class TestFlashPreemptsLiveSession:
             _close_listener(accept_loop, flash_listener)
 
         assert board.occupant is None
+
+
+# ---------------------------------------------------------------------------
+# Supervisor -- the USB watcher (ticket 006)
+# ---------------------------------------------------------------------------
+
+_UID_A = "aaaa" + "1" * 36           # 40 hex chars
+_UID_B = "bbbb" + "2" * 36           # 40 hex chars
+
+
+class TestSupervisorTick:
+    """`_tick(probes)` driven directly, per the ticket's own testing plan:
+    hand-built probe-list sequences against a fake `Advertiser` and a
+    fake `devices.probe_all` -- no sleeping, no real hardware, no real
+    mDNS."""
+
+    def test_tick_is_directly_callable_with_plain_probe_dicts(self, make_supervisor):
+        """No sleep, no hardware: a bare list of `{"uid": ...}` dicts is
+        enough to drive a full arrival."""
+        sup, adv, calls = make_supervisor({_UID_A: {"uid": _UID_A, "board_name": "tovez"}})
+        sup._tick([{"uid": _UID_A}])
+        assert _UID_A in sup.boards
+
+    def test_arrival_probes_registers_both_services_and_binds_two_listeners(
+        self, make_supervisor
+    ):
+        sup, adv, calls = make_supervisor(
+            {_UID_A: {"uid": _UID_A, "board_name": "tovez", "role": "", "enum": 1}}
+        )
+        sup._tick([{"uid": _UID_A}])
+
+        assert len(calls) == 1
+        assert calls[0]["only_uids"] == {_UID_A}
+
+        assert len(adv.register_calls) == 2
+        names = {c[0] for c in adv.register_calls}
+        assert names == {"tovez"}
+        service_types = {c[1] for c in adv.register_calls}
+        assert service_types == {server_mod.SERIAL_SERVICE_TYPE, server_mod.FLASH_SERVICE_TYPE}
+
+        board = sup.boards[_UID_A]
+        assert board.serial_listener is not None
+        assert board.flash_listener is not None
+        assert board.serial_listener.getsockname()[1] > 0
+        assert board.flash_listener.getsockname()[1] > 0
+        assert board.serial_mdns_handle is not None
+        assert board.flash_mdns_handle is not None
+
+    def test_departure_unregisters_both_services_and_closes_both_listeners(
+        self, make_supervisor
+    ):
+        sup, adv, calls = make_supervisor({_UID_A: {"uid": _UID_A, "board_name": "tovez"}})
+        sup._tick([{"uid": _UID_A}])
+        board = sup.boards[_UID_A]
+        serial_sock, flash_sock = board.serial_listener, board.flash_listener
+        serial_handle, flash_handle = board.serial_mdns_handle, board.flash_mdns_handle
+
+        sup._tick([])   # UID no longer present
+
+        assert _UID_A not in sup.boards
+        assert set(adv.unregister_calls) == {serial_handle, flash_handle}
+        assert serial_sock.fileno() == -1
+        assert flash_sock.fileno() == -1
+
+    def test_departure_does_not_skip_a_board_with_a_live_occupant(self, make_supervisor):
+        """Anti-regression test for the old bug (sprint.md Design Problem
+        1): a non-blocking lock acquire used to skip a board with a live
+        session on every tick, leaking its advertisement after unplug.
+        `_tick`'s departure detection must never contend for `Board.lock`
+        at all, so a live occupant is torn down and the board is
+        cleaned up regardless."""
+        sup, adv, calls = make_supervisor({_UID_A: {"uid": _UID_A, "board_name": "tovez"}})
+        sup._tick([{"uid": _UID_A}])
+        board = sup.boards[_UID_A]
+
+        thread_exited = threading.Event()
+        session = server_mod.SerialSession(DummyConn())
+
+        def _run():
+            session.stop.wait(timeout=2.0)
+            thread_exited.set()
+
+        thread = threading.Thread(target=_run, daemon=True)
+        session.thread = thread
+        board.occupant = session      # simulates a live, long-running session
+        thread.start()
+
+        start = time.time()
+        sup._tick([])                 # the board vanishes from the probe list
+        elapsed = time.time() - start
+
+        assert elapsed < 1.0, "departure blocked on the board lock"
+        assert _UID_A not in sup.boards
+        assert session.stop.is_set()
+        assert session.conn.closed is True
+        assert _wait_until(thread_exited.is_set)
+        thread.join(timeout=2.0)
+
+    def test_repeating_the_same_tick_twice_is_idempotent(self, make_supervisor):
+        sup, adv, calls = make_supervisor({_UID_A: {"uid": _UID_A, "board_name": "tovez"}})
+        sup._tick([{"uid": _UID_A}])
+        assert len(calls) == 1
+        assert len(adv.register_calls) == 2
+
+        sup._tick([{"uid": _UID_A}])   # same UID set again -- no-op
+        assert len(calls) == 1
+        assert len(adv.register_calls) == 2
+
+        sup._tick([])
+        assert len(adv.unregister_calls) == 2
+
+        sup._tick([])                  # already gone -- no-op, no error
+        assert len(adv.unregister_calls) == 2
+
+    def test_arrival_probe_never_touches_an_already_known_boards_entry(self, make_supervisor):
+        """Two simultaneously-connected fake boards: B's arrival must not
+        re-probe A, which is already known and still connected --
+        Supervisor-level coverage of the same guarantee Ticket 002 tests
+        at the `devices.probe_all` level."""
+        sup, adv, calls = make_supervisor(
+            {
+                _UID_A: {"uid": _UID_A, "board_name": "aaaaa"},
+                _UID_B: {"uid": _UID_B, "board_name": "bbbbb"},
+            }
+        )
+        sup._tick([{"uid": _UID_A}])
+        sup._tick([{"uid": _UID_A}, {"uid": _UID_B}])   # B arrives; A unchanged
+
+        assert calls[0]["only_uids"] == {_UID_A}
+        assert calls[1]["only_uids"] == {_UID_B}
+        assert _UID_A in sup.boards
+        assert _UID_B in sup.boards
+
+    @pytest.mark.parametrize(
+        "entry, expected",
+        [
+            ({"uid": _UID_A, "board_name": "tovez", "device_name": "other"}, "tovez"),
+            ({"uid": _UID_A, "board_name": "vevov"}, "vevov"),
+            ({"uid": _UID_A, "device_name": "getez"}, "getez"),
+            ({"uid": _UID_A}, f"mb-{_UID_A[-8:]}"),
+        ],
+        ids=["both-present-board_name-wins", "board_name-only", "device_name-only", "neither-uid-fallback"],
+    )
+    def test_instance_naming_fallback_order(self, make_supervisor, entry, expected):
+        sup, adv, calls = make_supervisor({_UID_A: entry})
+        sup._tick([{"uid": _UID_A}])
+        names = {c[0] for c in adv.register_calls}
+        assert names == {expected}
+        assert sup.boards[_UID_A].name == expected
+
+    def test_port_allocation_sequential_then_reclaimed_on_departure(self, make_supervisor):
+        sup, adv, calls = make_supervisor(
+            {
+                _UID_A: {"uid": _UID_A, "board_name": "aaaaa"},
+                _UID_B: {"uid": _UID_B, "board_name": "bbbbb"},
+            },
+            base_port=6000,
+        )
+        sup._tick([{"uid": _UID_A}])
+        board_a = sup.boards[_UID_A]
+        assert (board_a.serial_listener.getsockname()[1], board_a.flash_listener.getsockname()[1]) == (6000, 6001)
+
+        sup._tick([{"uid": _UID_A}, {"uid": _UID_B}])
+        board_b = sup.boards[_UID_B]
+        assert (board_b.serial_listener.getsockname()[1], board_b.flash_listener.getsockname()[1]) == (6002, 6003)
+
+        sup._tick([{"uid": _UID_B}])   # A departs -- its ports go to the free-list
+
+        sup._tick([{"uid": _UID_B}, {"uid": _UID_A}])   # A re-arrives
+        board_a2 = sup.boards[_UID_A]
+        assert (
+            board_a2.serial_listener.getsockname()[1],
+            board_a2.flash_listener.getsockname()[1],
+        ) == (6000, 6001), "departed board's ports should be reclaimed, not grown past 6003"
+
+    def test_base_port_unset_binds_ephemeral_ports_without_error(self, make_supervisor):
+        sup, adv, calls = make_supervisor(
+            {_UID_A: {"uid": _UID_A, "board_name": "tovez"}}, base_port=0
+        )
+        sup._tick([{"uid": _UID_A}])
+        board = sup.boards[_UID_A]
+        assert board.serial_listener.getsockname()[1] > 0
+        assert board.flash_listener.getsockname()[1] > 0
+        assert board.serial_listener.getsockname()[1] != board.flash_listener.getsockname()[1]

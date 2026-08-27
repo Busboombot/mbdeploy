@@ -8,11 +8,12 @@ shared :class:`AcceptLoop`, and the two wire-protocol handlers
 (:func:`serve_serial`, :func:`serve_flash`).
 
 ``Supervisor`` — the USB watcher that creates/destroys ``Board`` instances
-and drives their listener/mDNS lifecycle — is a separate ticket (006) and
-lives alongside this code in the same file, but nothing here reaches into
-its responsibilities: this module never opens a listener socket itself,
-never registers mDNS, and never decides which UIDs are currently
-connected.
+and drives their listener/mDNS lifecycle (ticket 006) — lives alongside
+this code in the same file, but nothing in the ``Board``/session code
+above reaches into its responsibilities: ``serve_serial``/``serve_flash``
+never open a listener socket themselves, never register mDNS, and never
+decide which UIDs are currently connected -- that is entirely
+``Supervisor``'s job.
 
 The concurrency contract (sprint.md, Design Problem 1)
 -------------------------------------------------------
@@ -32,6 +33,7 @@ reference to the session being torn down.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import json
@@ -42,7 +44,8 @@ import socket
 import tempfile
 import threading
 import time
-from typing import Callable
+from pathlib import Path
+from typing import Any, Callable
 
 from mbdeploy import console, devices
 from mbdeploy.devices import is_relay
@@ -145,6 +148,23 @@ class FlashSession(Session):
     kind = "flash"
 
 
+def _terminate_displaced(session: Session, timeout: float = PREEMPT_JOIN_TIMEOUT) -> None:
+    """Terminate and join a session that has just been displaced as a
+    board's occupant.
+
+    Shared by `serve_flash`'s preemption of a live `SerialSession` and
+    `Supervisor._on_departure`'s teardown of *any* live occupant (ticket
+    006) -- both call this only *after* the session has already been
+    atomically removed as the board's occupant (via `claim_flash`'s
+    returned ``previous``, or `Board.take_occupant()`), so this never
+    runs while anything still holds `Board.lock`. Factored out once
+    rather than duplicated, per Design Problem 1's own design note that
+    the two call sites are "the same pattern".
+    """
+    session.terminate()
+    session.join(timeout)
+
+
 # ---------------------------------------------------------------------------
 # Board
 # ---------------------------------------------------------------------------
@@ -233,6 +253,23 @@ class Board:
         with self.lock:
             if self.occupant is session:
                 self.occupant = None
+
+    def take_occupant(self) -> SerialSession | FlashSession | None:
+        """Atomically grab and clear whatever currently occupies the board.
+
+        Used by `Supervisor._on_departure` (ticket 006): unlike
+        ``claim_serial``/``claim_flash``/``release``, this doesn't care
+        what the occupant *is* -- USB departure must clean up a board
+        regardless of whether it was idle, mid-session, or mid-flash.
+        Returns ``None`` if the board was already idle. The lock is held
+        only for this read-and-clear; the caller terminates whatever is
+        returned (via `_terminate_displaced`) afterward, outside the
+        lock -- the same pattern `claim_flash`'s preemption uses.
+        """
+        with self.lock:
+            occupant = self.occupant
+            self.occupant = None
+            return occupant
 
 
 # ---------------------------------------------------------------------------
@@ -614,8 +651,10 @@ def serve_flash(
                 # Outside the lock (already released by claim_flash):
                 # tear down the displaced session and wait -- bounded --
                 # for it to actually exit before this flash proceeds.
-                previous.terminate()
-                previous.join(PREEMPT_JOIN_TIMEOUT)
+                # Shared with `Supervisor._on_departure` (ticket 006) via
+                # `_terminate_displaced` rather than duplicating this
+                # terminate()+join() sequence in two places.
+                _terminate_displaced(previous)
 
             _send_line(conn, "OK send")
             payload = _read_exact(conn, header["nbytes"], payload_timeout)
@@ -652,3 +691,280 @@ def serve_flash(
             board.release(session)
     finally:
         _close(conn)
+
+
+# ---------------------------------------------------------------------------
+# Supervisor -- the USB watcher (sprint.md Step 3, Design Problem 2)
+# ---------------------------------------------------------------------------
+
+#: Default `--poll-interval`, threaded through by ticket 007's CLI.
+DEFAULT_POLL_INTERVAL = 2.0
+
+#: Fully-qualified mDNS service types `Supervisor` registers.
+#: `Advertiser.register`'s own contract requires a type ending in a
+#: domain (e.g. ``"_mbserial._tcp.local."``).
+SERIAL_SERVICE_TYPE = "_mbserial._tcp.local."
+FLASH_SERVICE_TYPE = "_mbflash._tcp.local."
+
+
+def _instance_name(entry: dict, uid: str) -> str:
+    """mDNS instance name for a board: ``board_name`` -> ``device_name``
+    -> ``mb-<last 8 of uid>``.
+
+    ``board_name`` (read over SWD by `devices.probe_all`, part of every
+    arrival probe) comes first because it works on unflashed and silent
+    boards alike -- all four Nolanet boards currently announce nothing
+    (``role``/``device_name`` are both empty strings), so this is the
+    path that actually runs in production, not a rarely-hit fallback.
+    ``device_name`` (from a ``DEVICE:``/``device `` announcement) covers
+    a board whose SWD read failed. ``mb-<uid8>`` is the last resort, so
+    a board is always nameable even with neither identity source
+    available.
+    """
+    return entry.get("board_name") or entry.get("device_name") or f"mb-{uid[-8:]}"
+
+
+def _service_txt(entry: dict, uid: str, port: int) -> dict[str, str]:
+    """TXT record fields for one of a board's two mDNS registrations."""
+    return {
+        "uid": entry.get("uid") or uid,
+        "role": entry.get("role") or "",
+        "common_name": entry.get("common_name") or "",
+        "enum": str(entry.get("enum", "")),
+        "port": str(port),
+    }
+
+
+class Supervisor:
+    """USB watcher: keeps the live `Board` set in sync with which boards
+    are physically connected (sprint.md Step 3, Design Problem 2).
+
+    `_tick(probes)` is directly callable with a plain list of probe
+    dicts (``[{"uid": ...}, ...]``) -- no sleeping, no real hardware --
+    which is what makes the watcher testable. It diffs the incoming UID
+    set against the previous tick's, purely off that set: it never
+    touches `Board.lock` or `Board.occupant` to detect arrival or
+    departure, so a board mid-flash or mid-session is still detected as
+    departed the instant it disappears from `devices.flashable_probes()`
+    (sprint.md Design Problem 1's Supervisor-side half -- see
+    `_on_departure`).
+
+    Only arrival triggers a probe. This design has no periodic
+    re-probing of an already-known, still-connected board -- Nolanet is
+    a fixed single board per node, and nothing in this sprint's use
+    cases needs a board's identity to change without a replug -- so the
+    non-blocking lock-acquire the source issue describes for an optional
+    identity-refresh step is deliberately not implemented here: there is
+    no such step for it to guard.
+    """
+
+    def __init__(
+        self,
+        *,
+        accept_loop: AcceptLoop,
+        advertiser: Any,
+        config_path: Path,
+        base_port: int = 0,
+        bind: str = "",
+        target_mcu: str = devices.DEFAULT_MCU,
+        token: str | None = None,
+        no_flash: bool = False,
+    ) -> None:
+        self.accept_loop = accept_loop
+        self.advertiser = advertiser
+        self.config_path = config_path
+        self.base_port = base_port
+        self.bind = bind
+        self.target_mcu = target_mcu
+        self.token = token
+        self.no_flash = no_flash
+
+        #: uid -> live Board, for every currently-connected board.
+        self.boards: dict[str, Board] = {}
+        #: The previous tick's UID set; `_tick` diffs against this.
+        self._known: set[str] = set()
+        #: Sequential port allocation from `base_port`, and a free-list of
+        #: departed boards' port pairs available for reuse (sprint.md
+        #: Step 7's Open Question, resolved there: reclaim rather than
+        #: retire). Unused when `base_port` is 0/unset -- listeners bind
+        #: OS-assigned ephemeral ports instead, and there is nothing to
+        #: reclaim.
+        self._next_port: int | None = base_port if base_port else None
+        self._port_freelist: list[tuple[int, int]] = []
+        #: uid -> the (serial, flash) ports actually handed out for it,
+        #: so `_on_departure` reclaims exactly what `_on_arrival` gave
+        #: out. Only populated when `base_port` is set.
+        self._board_ports: dict[str, tuple[int, int]] = {}
+
+    # -- the tick -------------------------------------------------------
+
+    def _tick(self, probes: list[dict]) -> None:
+        """Diff `probes`' UID set against the previous tick and fire
+        `_on_arrival`/`_on_departure` for each change.
+
+        Never touches `Board.lock`/`Board.occupant` -- the whole diff is
+        computed from `probes` alone, which is exactly why a board
+        mid-session is still detected as departed (sprint.md Design
+        Problem 1). Repeating the same probe list twice is idempotent:
+        the second call computes empty `arrived`/`departed` sets and
+        does nothing.
+        """
+        current = {p["uid"] for p in probes}
+        departed = self._known - current
+        arrived = current - self._known
+        for uid in departed:
+            self._on_departure(uid)
+        for uid in arrived:
+            self._on_arrival(uid)
+        self._known = current
+
+    # -- arrival ----------------------------------------------------------
+
+    def _on_arrival(self, uid: str) -> None:
+        """Refresh this board's identity, bind its listeners, and
+        register both mDNS services.
+
+        Calls ``devices.probe_all(only_uids={uid})`` -- ticket 002's
+        scoping parameter -- so this never sends a stray `HELLO` to any
+        other already-connected board (sprint.md Design Problem 2). This
+        is the *only* caller in `Supervisor` that ever invokes
+        `probe_all`.
+        """
+        entries = devices.probe_all(
+            self.config_path, target_mcu=self.target_mcu, only_uids={uid}
+        )
+        entry = next((e for e in entries if e.get("uid") == uid), {"uid": uid})
+        name = _instance_name(entry, uid)
+
+        serial_port, flash_port = self._alloc_ports()
+        serial_listener = self._bind_listener(serial_port)
+        flash_listener = self._bind_listener(flash_port)
+        serial_port = serial_listener.getsockname()[1]
+        flash_port = flash_listener.getsockname()[1]
+
+        board = Board(
+            uid, name, entry,
+            serial_listener=serial_listener,
+            flash_listener=flash_listener,
+        )
+        board.serial_mdns_handle = self.advertiser.register(
+            name, SERIAL_SERVICE_TYPE, serial_port, _service_txt(entry, uid, serial_port)
+        )
+        board.flash_mdns_handle = self.advertiser.register(
+            name, FLASH_SERVICE_TYPE, flash_port, _service_txt(entry, uid, flash_port)
+        )
+
+        self.accept_loop.register(
+            serial_listener,
+            functools.partial(serve_serial, board, token=self.token),
+        )
+        self.accept_loop.register(
+            flash_listener,
+            functools.partial(
+                serve_flash,
+                board,
+                token=self.token,
+                no_flash=self.no_flash,
+                target_mcu=self.target_mcu,
+            ),
+        )
+
+        self.boards[uid] = board
+        if self.base_port:
+            self._board_ports[uid] = (serial_port, flash_port)
+
+    # -- departure ----------------------------------------------------------
+
+    def _on_departure(self, uid: str) -> None:
+        """Tear a departed board down: kill any live session, unregister
+        both mDNS services, close both listeners, reclaim its ports.
+
+        Detected purely from `uid` being absent from the latest probe
+        list -- `_tick` never acquired `Board.lock` to get here. The
+        lock *is* taken here, but only for the instant
+        `Board.take_occupant()` needs to grab and clear whatever
+        currently occupies the board; the `terminate()`/`join()` that
+        actually tears the session down (`_terminate_displaced`) runs
+        afterward, outside that lock -- the same pattern `serve_flash`'s
+        preemption uses. This is precisely what stops a board with a
+        long-lived serial session from being skipped and leaking its
+        mDNS advertisement after unplug (sprint.md Design Problem 1).
+        """
+        board = self.boards.pop(uid, None)
+        if board is None:
+            return
+        board.connected = False
+
+        occupant = board.take_occupant()
+        if occupant is not None:
+            _terminate_displaced(occupant)
+
+        if board.serial_mdns_handle is not None:
+            self.advertiser.unregister(board.serial_mdns_handle)
+            board.serial_mdns_handle = None
+        if board.flash_mdns_handle is not None:
+            self.advertiser.unregister(board.flash_mdns_handle)
+            board.flash_mdns_handle = None
+
+        if board.serial_listener is not None:
+            self.accept_loop.unregister(board.serial_listener)
+            board.serial_listener.close()
+            board.serial_listener = None
+        if board.flash_listener is not None:
+            self.accept_loop.unregister(board.flash_listener)
+            board.flash_listener.close()
+            board.flash_listener = None
+
+        ports = self._board_ports.pop(uid, None)
+        if ports is not None:
+            self._port_freelist.append(ports)
+
+    # -- port allocation ------------------------------------------------
+
+    def _alloc_ports(self) -> tuple[int | None, int | None]:
+        """Two ports for an arriving board.
+
+        `base_port` unset/0: returns ``(None, None)`` -- `_bind_listener`
+        binds an OS-assigned ephemeral port for each. `base_port` set:
+        reuses a departed board's port pair if one is free, else the
+        next two ports sequentially from `base_port` -- a free-list
+        rather than an ever-growing counter (sprint.md Step 7's Open
+        Question).
+        """
+        if not self.base_port:
+            return None, None
+        if self._port_freelist:
+            return self._port_freelist.pop()
+        assert self._next_port is not None
+        ports = (self._next_port, self._next_port + 1)
+        self._next_port += 2
+        return ports
+
+    def _bind_listener(self, port: int | None) -> socket.socket:
+        """Bind and listen on `port` (or an OS-assigned ephemeral port
+        when `port` is `None`), on `self.bind`."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.bind, port or 0))
+        sock.listen(5)
+        return sock
+
+    # -- polling loop -----------------------------------------------------
+
+    def run(
+        self,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+        stop: threading.Event | None = None,
+    ) -> None:
+        """Call ``_tick(devices.flashable_probes())`` every
+        `poll_interval` seconds until `stop` is set.
+
+        `stop` defaults to a private `Event` nothing else can signal --
+        callers that need to end the loop (ticket 007's `serve`
+        subcommand, on SIGINT/SIGTERM) pass their own.
+        """
+        if stop is None:
+            stop = threading.Event()
+        while not stop.is_set():
+            self._tick(devices.flashable_probes())
+            stop.wait(poll_interval)
