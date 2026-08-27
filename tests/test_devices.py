@@ -782,6 +782,237 @@ class TestProbeAllPreservesAnnouncementOnNone:
 
 
 # ---------------------------------------------------------------------------
+# probe_all -- only_uids scoping (Ticket 002 / Design Problem 2, sprint 002)
+# ---------------------------------------------------------------------------
+
+class _RecordingProbePort:
+    """Fake serial.Serial that records which port was opened/written to.
+
+    Proves probe_all's ``only_uids`` scoping never opens a serial port, nor
+    writes HELLO, for an excluded UID. ``readline`` raises immediately after
+    ``write`` so the real ``probe_type`` returns via its outer
+    ``except Exception: return None`` instead of busy-spinning for its full
+    1.6s read-timeout window (there is no ``sleep`` in that loop to patch
+    away).
+    """
+
+    def __init__(self):
+        self.port = None
+        self.is_open = False
+        self.opened_ports: list[str] = []
+        self.written_ports: list[str] = []
+
+    def open(self):
+        self.is_open = True
+        self.opened_ports.append(self.port)
+
+    def reset_input_buffer(self):
+        pass
+
+    def write(self, data):
+        self.written_ports.append(self.port)
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def readline(self):
+        raise RuntimeError("probe_type stops here in this fake")
+
+    def close(self):
+        self.is_open = False
+
+
+class TestProbeAllOnlyUids:
+    """``only_uids`` narrows probe_all's expensive per-board work (port
+    refresh's HELLO write, SWD board-name read) to exactly the named UIDs,
+    so a hotplug watcher can refresh one arriving board without disturbing
+    every other board already connected.
+    """
+
+    _UID_A = _DEVICE_UID
+    _UID_B = _DEVICE2_UID
+    _PORT_A = "/dev/cu.device1"
+    _PORT_B = "/dev/cu.device2"
+
+    def _both_connected(self, monkeypatch):
+        monkeypatch.setattr(devices_mod.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [
+                {"uid": self._UID_A, "description": "a"},
+                {"uid": self._UID_B, "description": "b"},
+            ],
+        )
+
+    def test_only_uids_none_probes_everything(self, monkeypatch, tmp_path):
+        """Default (None) is today's unscoped behavior: both boards probed."""
+        self._both_connected(monkeypatch)
+        seen_known = []
+
+        def _ports(known):
+            seen_known.append(set(known))
+            return {self._UID_A: self._PORT_A, self._UID_B: self._PORT_B}
+
+        monkeypatch.setattr(devices_mod, "port_serial_map", _ports)
+        probed_ports = []
+        monkeypatch.setattr(
+            devices_mod, "probe_type",
+            lambda port: probed_ports.append(port) or None,
+        )
+        monkeypatch.setattr(devices_mod, "read_device_id", lambda uid, mcu: None)
+
+        config = tmp_path / "devices.json"
+        entries = devices_mod.probe_all(config)
+
+        assert seen_known == [{self._UID_A, self._UID_B}]
+        assert set(probed_ports) == {self._PORT_A, self._PORT_B}
+        assert {e["uid"] for e in entries} == {self._UID_A, self._UID_B}
+
+    def test_only_uids_narrows_to_named_board(self, monkeypatch, tmp_path):
+        """only_uids={uid_a} touches uid_a only: uid_b is never passed to
+        port_serial_map, probe_type (HELLO), or read_device_id, and its
+        existing registry entry is left byte-for-byte unchanged.
+        """
+        self._both_connected(monkeypatch)
+        config = tmp_path / "devices.json"
+        prior_b = {
+            "uid": self._UID_B, "enum": 2, "port": "/dev/stale-b",
+            "role": "Nezha2", "common_name": "gutov", "device_name": "gutov-main",
+        }
+        config.write_text(json.dumps({self._UID_B: prior_b}))
+
+        seen_known = []
+
+        def _ports(known):
+            seen_known.append(set(known))
+            return {self._UID_A: self._PORT_A, self._UID_B: self._PORT_B}
+
+        monkeypatch.setattr(devices_mod, "port_serial_map", _ports)
+
+        recorder = _RecordingProbePort()
+        monkeypatch.setattr(devices_mod.serial, "Serial", lambda **kwargs: recorder)
+
+        read_device_id_calls = []
+        monkeypatch.setattr(
+            devices_mod, "read_device_id",
+            lambda uid, mcu: read_device_id_calls.append(uid) or None,
+        )
+
+        entries = devices_mod.probe_all(config, only_uids={self._UID_A})
+
+        # uid_b was never even named to port_serial_map.
+        assert seen_known == [{self._UID_A}]
+
+        # The real probe_type ran only for uid_a's port -- HELLO never
+        # reached uid_b's port because probe_type was never invoked for it.
+        assert recorder.opened_ports == [self._PORT_A]
+        assert recorder.written_ports == [self._PORT_A]
+
+        # The SWD board-name read also only ever named uid_a.
+        assert read_device_id_calls == [self._UID_A]
+
+        by_uid = {e["uid"]: e for e in entries}
+        assert by_uid[self._UID_A]["port"] == self._PORT_A
+        assert by_uid[self._UID_B] == prior_b  # untouched, byte-for-byte
+
+        saved = devices_mod.load_devices(config)
+        assert saved[self._UID_B] == prior_b
+
+    def test_only_uids_empty_set_probes_nothing(self, monkeypatch, tmp_path):
+        """An empty set narrows to nothing -- a no-op refresh, distinct from
+        None (which means "don't narrow"). Every entry is preserved as-is.
+        """
+        self._both_connected(monkeypatch)
+        config = tmp_path / "devices.json"
+        prior = {
+            self._UID_A: {"uid": self._UID_A, "enum": 1, "port": "/dev/stale-a"},
+            self._UID_B: {"uid": self._UID_B, "enum": 2, "port": "/dev/stale-b"},
+        }
+        config.write_text(json.dumps(prior))
+
+        seen_known = []
+        monkeypatch.setattr(
+            devices_mod, "port_serial_map",
+            lambda known: seen_known.append(set(known)) or {},
+        )
+
+        def _boom_probe(port):
+            raise AssertionError("probe_type must not run when only_uids is empty")
+
+        def _boom_read(uid, mcu):
+            raise AssertionError("read_device_id must not run when only_uids is empty")
+
+        monkeypatch.setattr(devices_mod, "probe_type", _boom_probe)
+        monkeypatch.setattr(devices_mod, "read_device_id", _boom_read)
+
+        entries = devices_mod.probe_all(config, only_uids=set())
+
+        assert seen_known == [set()]
+        # No board was probed, but existing registry entries are still
+        # loaded and returned untouched -- this is a no-op refresh, not a
+        # wipe (that guard is `clear`, tested separately).
+        assert {e["uid"] for e in entries} == {self._UID_A, self._UID_B}
+        saved = devices_mod.load_devices(config)
+        assert saved == prior
+
+    def test_only_uids_with_disconnected_uid_is_ignored(self, monkeypatch, tmp_path):
+        """A UID named in only_uids that isn't currently connected has
+        nothing to filter down to -- it's simply absent from the result,
+        with no error and no effect on the UIDs that are connected.
+        """
+        self._both_connected(monkeypatch)
+        config = tmp_path / "devices.json"
+
+        seen_known = []
+
+        def _ports(known):
+            seen_known.append(set(known))
+            return {self._UID_A: self._PORT_A}
+
+        monkeypatch.setattr(devices_mod, "port_serial_map", _ports)
+        monkeypatch.setattr(devices_mod, "probe_type", lambda port: None)
+        monkeypatch.setattr(devices_mod, "read_device_id", lambda uid, mcu: None)
+
+        not_connected_uid = "9906" + "e" * 36
+        entries = devices_mod.probe_all(
+            config, only_uids={self._UID_A, not_connected_uid}
+        )
+
+        assert seen_known == [{self._UID_A}]
+        assert {e["uid"] for e in entries} == {self._UID_A}
+
+    def test_only_uids_with_clear_raises_before_touching_registry(
+        self, monkeypatch, tmp_path
+    ):
+        """clear wipes the registry down to what this call sees, which
+        would silently erase every non-only_uids board's entry -- so the
+        combination is rejected outright, before the registry file (or any
+        hardware) is touched at all.
+        """
+        config = tmp_path / "devices.json"
+        config.write_text(json.dumps({self._UID_A: {"uid": self._UID_A, "enum": 1}}))
+        original_text = config.read_text()
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(
+                "nothing should run once only_uids+clear=True is rejected"
+            )
+
+        monkeypatch.setattr(devices_mod, "load_devices", _boom)
+        monkeypatch.setattr(devices_mod, "flashable_probes", _boom)
+        monkeypatch.setattr(devices_mod, "port_serial_map", _boom)
+        monkeypatch.setattr(devices_mod, "probe_type", _boom)
+        monkeypatch.setattr(devices_mod, "read_device_id", _boom)
+        monkeypatch.setattr(devices_mod, "save_devices", _boom)
+
+        with pytest.raises(ValueError):
+            devices_mod.probe_all(config, clear=True, only_uids={self._UID_A})
+
+        assert config.read_text() == original_text
+
+
+# ---------------------------------------------------------------------------
 # deploy — auto-pick
 # ---------------------------------------------------------------------------
 

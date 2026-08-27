@@ -321,7 +321,10 @@ def connected_uids() -> set[str]:
 
 
 def probe_all(
-    config_path: Path, clear: bool = False, target_mcu: str = DEFAULT_MCU
+    config_path: Path,
+    clear: bool = False,
+    target_mcu: str = DEFAULT_MCU,
+    only_uids: set[str] | None = None,
 ) -> list[dict]:
     """Discover all connected probes, probe each port, update and save the registry.
 
@@ -335,10 +338,37 @@ def probe_all(
     - Boards with no serial port get an entry with ``port: null``.
     - Entries are never deleted.
 
+    ``only_uids``
+    -------------
+    When ``None`` (the default), every connected probe is touched — today's
+    unscoped behavior, unchanged. When given a set, the probe loop is
+    narrowed to exactly those UIDs *before* anything else happens: a UID not
+    in the set is never passed to ``port_serial_map``, ``probe_type`` (the
+    ``HELLO`` write), or ``read_device_id`` (the SWD board-name read) by this
+    call, and its existing registry entry, if any, is left byte-for-byte
+    unchanged. An empty set narrows to nothing — a no-op refresh — which is
+    why the default is ``None`` rather than ``set()``: the two mean "don't
+    narrow" and "narrow to nothing" respectively.
+
+    This exists so a caller that already knows *which* board just changed
+    (e.g. a USB hotplug watcher) can refresh that board alone, without
+    opening a serial port — and possibly writing ``HELLO`` into a board mid
+    session — for every other board already connected.
+
+    Combining ``only_uids`` with ``clear=True`` raises ``ValueError`` before
+    touching the registry file: ``clear`` wipes the registry down to what
+    this call sees, which would silently delete every other board's entry
+    if the call were also scoped to a subset of UIDs.
+
     Returns the updated list of device dicts.
     """
+    if only_uids is not None and clear:
+        raise ValueError("only_uids cannot be combined with clear=True")
+
     devices = {} if clear else load_devices(config_path)
     probes = flashable_probes()
+    if only_uids is not None:
+        probes = [p for p in probes if p["uid"] in only_uids]
     uids = {p["uid"] for p in probes}
     ports = port_serial_map(uids)
 
