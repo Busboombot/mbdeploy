@@ -1,7 +1,7 @@
 ---
 id: '004'
 title: 'console.relay_socket: bidirectional serial-socket pump for network sessions'
-status: in-progress
+status: done
 use-cases:
 - SUC-004
 depends-on: []
