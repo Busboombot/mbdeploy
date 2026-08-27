@@ -580,13 +580,69 @@ def _deploy_entry(target: str, registry: dict[str, dict]) -> dict:
     return entry
 
 
-def _cmd_deploy(args: argparse.Namespace) -> int:
-    import mbdeploy.devices as devices_mod
+def _cmd_deploy_remote(
+    args: argparse.Namespace, hex_path: str, target_mcu: str, force_relay: bool
+) -> int:
+    """`deploy --remote`: build/clean locally exactly as today, then stream
+    the resulting hex over `_mbflash._tcp` instead of calling
+    `flash_mod.flash_hex` against a local USB connection.
 
-    config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
+    No registry lookup, no relay guard, no live-probe confirmation here --
+    all three are local-registry concerns this branch has no registry to
+    perform them against; the relay guard in particular is still enforced,
+    just server-side (`serve_flash`'s existing `is_relay(...)` check),
+    since only the daemon knows the remote board's `role`. `--build`/
+    `--clean` run first and unchanged (same `builder.run` call, same
+    argument names) so a remote deploy builds from the exact same source
+    a local one would, before anything touches the network.
+    """
+    if args.build or args.clean:
+        from mbdeploy import builder
+
+        rc = builder.run(
+            clean=args.clean,
+            verbose=getattr(args, "verbose", False),
+            jobs=args.jobs,
+        )
+        if rc != 0:
+            print(f"Error: build failed (exit {rc}).", file=sys.stderr)
+            return rc
+
+    from mbdeploy import remote as remote_mod
+
+    return remote_mod.deploy_over_network(
+        args.target, hex_path, target_mcu, force_relay=force_relay,
+    )
+
+
+def _cmd_deploy(args: argparse.Namespace) -> int:
+    remote = getattr(args, "remote", False)
+    if remote and args.target and (args.target.startswith("/dev/") or "/" in args.target):
+        print(
+            f"Error: --remote cannot be combined with a device path "
+            f"('{args.target}').",
+            file=sys.stderr,
+        )
+        return 1
+    if remote and not args.target:
+        print(
+            "Error: --remote requires a target board name -- unlike local "
+            "deploy, there is no local registry of remote boards to "
+            "auto-pick from.",
+            file=sys.stderr,
+        )
+        return 1
+
     hex_path = args.hex if args.hex else _DEFAULT_HEX
     target_mcu = args.target_mcu if args.target_mcu else _DEFAULT_MCU
     force_relay = args.force_relay
+
+    if remote:
+        return _cmd_deploy_remote(args, hex_path, target_mcu, force_relay)
+
+    import mbdeploy.devices as devices_mod
+
+    config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
 
     # --- resolve device entry ---
     registry = devices_mod.load_devices(config_path)
@@ -1145,6 +1201,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     deploy_p.add_argument(
         "--config", metavar="PATH", help="Path to device config file."
+    )
+    deploy_p.add_argument(
+        "--remote",
+        action="store_true",
+        help="Resolve target as a board name currently advertising "
+             "_mbflash._tcp on the LAN via mDNS, and flash it over the "
+             "network instead of a local USB connection. --build/--clean "
+             "still run locally, unchanged, before the network exchange "
+             "starts. Mutually exclusive with a /dev/... target and "
+             "requires a target (no local registry to auto-pick from) -- "
+             "both rejected before any mDNS lookup or socket I/O.",
     )
     deploy_p.set_defaults(func=_cmd_deploy)
 

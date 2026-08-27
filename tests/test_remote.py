@@ -22,6 +22,7 @@ fake ``mdns.browse()`` -- no real zeroconf traffic. `cli.py`'s `_cmd_list`
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import re
 import socket
@@ -1028,3 +1029,802 @@ class TestCmdConnectRemote:
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "Error: cannot connect to" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# deploy_over_network() -- the FLASH client protocol
+#
+# Ticket 005. Two layers, per the ticket's own testing plan:
+#
+# - `ScriptedFlashServer`: a real loopback TCP listener scripted to play
+#   `serve_flash`'s side of the wire protocol for exactly one connection --
+#   used to drive `deploy_over_network` through the success path, each
+#   named `ERR`, and the force-relay/sha256 header fields.
+# - `TestDeployOverNetworkAgainstRealServeFlash`: the *actual*
+#   `server.serve_flash` handler (only `flash_hex` stubbed) on the other
+#   end of the same loopback socket -- proves both sides agree on the wire
+#   format, which two independently written fakes could not.
+# ---------------------------------------------------------------------------
+
+
+def _srv_read_line(conn: socket.socket, timeout: float = 2.0) -> bytes:
+    """Server-side line read for a `ScriptedFlashServer` handler: one
+    `\\n`-terminated line, without the newline. Mirrors the byte-at-a-time
+    style `server.py::_read_line` uses, for the same reason -- nothing
+    read here may swallow bytes belonging to the payload that follows."""
+    conn.settimeout(timeout)
+    buf = bytearray()
+    while True:
+        b = conn.recv(1)
+        if not b or b == b"\n":
+            return bytes(buf)
+        buf.extend(b)
+
+
+def _srv_read_exact(conn: socket.socket, n: int, timeout: float = 2.0) -> bytes:
+    """Server-side read of up to exactly `n` bytes, or fewer on EOF."""
+    conn.settimeout(timeout)
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(min(4096, n - len(buf)))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+class ScriptedFlashServer:
+    """A real ``127.0.0.1`` TCP listener that runs ``handler(conn)`` for
+    exactly one accepted connection, in a background thread.
+
+    ``handler`` owns the entire exchange -- reading the `FLASH` header
+    line (and, if it chooses, the declared payload), then writing back
+    whatever `serve_flash`-shaped response sequence the test wants to
+    exercise `remote.deploy_over_network` against. Any exception raised
+    inside ``handler`` is captured and re-raised from :meth:`close`, so a
+    broken scripted handler fails the test loudly instead of just letting
+    the client hang or time out with no explanation.
+    """
+
+    def __init__(self, handler) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)
+        self.port = self._sock.getsockname()[1]
+        self._handler = handler
+        self.error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        self._sock.settimeout(2.0)
+        try:
+            conn, _addr = self._sock.accept()
+        except OSError:
+            return
+        try:
+            self._handler(conn)
+        except BaseException as exc:  # noqa: BLE001 -- surfaced by close()
+            self.error = exc
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=2.0)
+        if self.error is not None:
+            raise self.error
+
+
+def _patch_resolve_to(monkeypatch, server: ScriptedFlashServer, name: str = "togov") -> None:
+    monkeypatch.setattr(
+        remote_mod, "resolve_board",
+        lambda target, service_type, timeout=2.0: {
+            "name": name, "host": "127.0.0.1", "port": server.port, "txt": {},
+        },
+    )
+
+
+class TestDeployOverNetworkWireProtocol:
+    def test_success_path_sends_correct_header_relays_log_and_returns_zero(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        payload = b":10000000FF00112233\n:00000001FF\n"
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(payload)
+        expected_digest = hashlib.sha256(payload).hexdigest()
+        seen = {}
+
+        def handler(conn):
+            header = _srv_read_line(conn).decode()
+            seen["header"] = header
+            conn.sendall(b"OK send\n")
+            m = re.match(r"FLASH (\d+)", header)
+            seen["payload"] = _srv_read_exact(conn, int(m.group(1)))
+            conn.sendall(b"LOG erasing\n")
+            conn.sendall(b"LOG programming\n")
+            conn.sendall(b"OK flashed\n")
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server)
+            rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+        finally:
+            server.close()
+
+        assert rc == 0
+        assert seen["header"] == f"FLASH {len(payload)} sha256={expected_digest}"
+        assert seen["payload"] == payload           # exact byte count, exact bytes
+        err = capsys.readouterr().err
+        assert "erasing" in err
+        assert "programming" in err
+
+    def test_force_relay_token_present_only_when_flag_is_true(
+        self, tmp_path, monkeypatch
+    ):
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+        headers = []
+
+        def handler(conn):
+            headers.append(_srv_read_line(conn).decode())
+            conn.sendall(b"OK send\n")
+            _srv_read_exact(conn, len(b"payload-bytes"))
+            conn.sendall(b"OK flashed\n")
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server)
+            rc = remote_mod.deploy_over_network(
+                "togov", str(hex_path), "nrf52833", force_relay=True,
+            )
+        finally:
+            server.close()
+
+        assert rc == 0
+        assert headers[0].endswith(" force-relay")
+
+    def test_force_relay_token_absent_by_default(self, tmp_path, monkeypatch):
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+        headers = []
+
+        def handler(conn):
+            headers.append(_srv_read_line(conn).decode())
+            conn.sendall(b"OK send\n")
+            _srv_read_exact(conn, len(b"payload-bytes"))
+            conn.sendall(b"OK flashed\n")
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server)
+            rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+        finally:
+            server.close()
+
+        assert rc == 0
+        assert "force-relay" not in headers[0]
+
+
+class TestDeployOverNetworkErrCases:
+    """Each of `serve_flash`'s named `ERR` lines, verbatim, must map to a
+    non-zero exit with the message visible on stderr."""
+
+    @pytest.mark.parametrize(
+        "err_line",
+        [
+            "ERR busy",
+            "ERR relay refused — send force-relay",
+            "ERR flash disabled",
+            "ERR auth required",
+        ],
+    )
+    def test_immediate_err_instead_of_ok_send(
+        self, tmp_path, monkeypatch, capsys, err_line
+    ):
+        """These are all responses `serve_flash` can send *instead of*
+        `OK send`, before ever reading a payload."""
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+
+        def handler(conn):
+            _srv_read_line(conn)
+            conn.sendall((err_line + "\n").encode())
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server)
+            rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+        finally:
+            server.close()
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert err_line[len("ERR "):] in err
+
+    def test_sha256_mismatch_after_payload_sent(self, tmp_path, monkeypatch, capsys):
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+
+        def handler(conn):
+            header = _srv_read_line(conn).decode()
+            conn.sendall(b"OK send\n")
+            m = re.match(r"FLASH (\d+)", header)
+            _srv_read_exact(conn, int(m.group(1)))
+            conn.sendall(b"ERR sha256 mismatch\n")
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server)
+            rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+        finally:
+            server.close()
+
+        assert rc != 0
+        assert "sha256 mismatch" in capsys.readouterr().err
+
+    def test_short_payload_after_payload_sent(self, tmp_path, monkeypatch, capsys):
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+
+        def handler(conn):
+            _srv_read_line(conn)
+            conn.sendall(b"OK send\n")
+            _srv_read_exact(conn, 4)     # deliberately reads less than declared
+            conn.sendall(b"ERR short payload\n")
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server)
+            rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+        finally:
+            server.close()
+
+        assert rc != 0
+        assert "short payload" in capsys.readouterr().err
+
+    def test_flash_failed_terminal_line_after_log_lines(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+
+        def handler(conn):
+            header = _srv_read_line(conn).decode()
+            conn.sendall(b"OK send\n")
+            m = re.match(r"FLASH (\d+)", header)
+            _srv_read_exact(conn, int(m.group(1)))
+            conn.sendall(b"LOG erasing\n")
+            conn.sendall(b"ERR flash failed (exit 3)\n")
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server)
+            rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+        finally:
+            server.close()
+
+        assert rc != 0
+        captured = capsys.readouterr()
+        assert "erasing" in captured.err
+        assert "flash failed (exit 3)" in captured.err
+
+    def test_resolution_failure_errors_clearly_without_touching_a_socket(
+        self, monkeypatch, capsys
+    ):
+        def _boom_resolve(*a, **k):
+            raise ValueError("no board named 'nope' found advertising _mbflash._tcp.local.")
+
+        def _boom_connect(*a, **k):
+            raise AssertionError("must not open a socket after resolve_board fails")
+
+        monkeypatch.setattr(remote_mod, "resolve_board", _boom_resolve)
+        monkeypatch.setattr(remote_mod.socket, "create_connection", _boom_connect)
+
+        rc = remote_mod.deploy_over_network("nope", "MICROBIT.hex", "nrf52833")
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("Error: ")
+        assert "no board named 'nope'" in captured.err
+
+    def test_missing_hex_file_errors_clearly_without_touching_a_socket(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            remote_mod, "resolve_board",
+            lambda *a, **k: {"name": "togov", "host": "127.0.0.1", "port": 1, "txt": {}},
+        )
+
+        def _boom_connect(*a, **k):
+            raise AssertionError("must not open a socket for an unreadable hex file")
+
+        monkeypatch.setattr(remote_mod.socket, "create_connection", _boom_connect)
+
+        missing = tmp_path / "does-not-exist.hex"
+        rc = remote_mod.deploy_over_network("togov", str(missing), "nrf52833")
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.err.startswith("Error: ")
+        assert "does-not-exist.hex" in captured.err
+
+    def test_connection_refused_errors_clearly(self, tmp_path, monkeypatch, capsys):
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()                  # nothing listening on `port` now
+
+        monkeypatch.setattr(
+            remote_mod, "resolve_board",
+            lambda *a, **k: {"name": "togov", "host": "127.0.0.1", "port": port, "txt": {}},
+        )
+
+        rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+
+        assert rc == 1
+        assert "Error: cannot connect to" in capsys.readouterr().err
+
+    def test_stalled_connection_times_out_rather_than_hanging(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A truncated exchange (server accepts, replies OK send, reads the
+        payload, then goes silent forever) must not hang this test --
+        bounded by `_FLASH_READ_TIMEOUT`, monkeypatched small here."""
+        monkeypatch.setattr(remote_mod, "_FLASH_READ_TIMEOUT", 0.2)
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+
+        def handler(conn):
+            header = _srv_read_line(conn).decode()
+            conn.sendall(b"OK send\n")
+            m = re.match(r"FLASH (\d+)", header)
+            _srv_read_exact(conn, int(m.group(1)))
+            time.sleep(2.0)              # far longer than the read timeout
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server)
+            start = time.time()
+            rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+            elapsed = time.time() - start
+        finally:
+            server.close()
+
+        assert rc != 0
+        assert elapsed < 2.0
+        assert "no response" in capsys.readouterr().err.lower()
+
+
+class TestDeployOverNetworkAgainstRealServeFlash:
+    """Drives `deploy_over_network` against `server.py`'s actual
+    `serve_flash` handler -- only `flash_hex` is stubbed. Proves the
+    client and server sides agree on the wire format, which two
+    independently written fakes could not."""
+
+    def test_success_round_trip_against_real_serve_flash(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import mbdeploy.server as server_mod
+
+        payload = b":10000000FF00112233\n:00000001FF\n"
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(payload)
+
+        def fake_flash_hex(uid, hp, target_mcu, log=None):
+            with open(hp, "rb") as f:
+                written = f.read()
+            assert written == payload
+            if log is not None:
+                log("erasing")
+                log("programming")
+            return 0
+
+        monkeypatch.setattr(server_mod, "flash_hex", fake_flash_hex)
+
+        board = server_mod.Board(
+            "uid-real-1", "togov", {"uid": "uid-real-1", "port": "/dev/fake0", "role": ""}
+        )
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        def _run():
+            listener.settimeout(2.0)
+            try:
+                conn, _addr = listener.accept()
+            except OSError:
+                return
+            try:
+                server_mod.serve_flash(board, conn)
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        monkeypatch.setattr(
+            remote_mod, "resolve_board",
+            lambda name, service_type, timeout=2.0: {
+                "name": "togov", "host": "127.0.0.1", "port": port, "txt": {},
+            },
+        )
+
+        try:
+            rc = remote_mod.deploy_over_network("togov", str(hex_path), "nrf52833")
+        finally:
+            thread.join(timeout=2.0)
+            listener.close()
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "erasing" in err
+        assert "programming" in err
+
+    def test_relay_guard_refusal_against_real_serve_flash(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import mbdeploy.server as server_mod
+
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+
+        board = server_mod.Board(
+            "uid-real-2", "solob",
+            {"uid": "uid-real-2", "port": "/dev/fake1", "role": "RADIOBRIDGE"},
+        )
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        def _run():
+            listener.settimeout(2.0)
+            try:
+                conn, _addr = listener.accept()
+            except OSError:
+                return
+            try:
+                server_mod.serve_flash(board, conn)
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        monkeypatch.setattr(
+            remote_mod, "resolve_board",
+            lambda name, service_type, timeout=2.0: {
+                "name": "solob", "host": "127.0.0.1", "port": port, "txt": {},
+            },
+        )
+
+        try:
+            rc = remote_mod.deploy_over_network("solob", str(hex_path), "nrf52833")
+        finally:
+            thread.join(timeout=2.0)
+            listener.close()
+
+        assert rc != 0
+        assert "relay refused" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# `deploy --remote` wiring: cli._cmd_deploy's remote branch
+#
+# Ticket 005.
+# ---------------------------------------------------------------------------
+
+
+def _deploy_remote_args(
+    target=None, remote=True, build=False, clean=False, jobs=None,
+    force_relay=False, hex_path=None, target_mcu="nrf52833", config=None,
+    verbose=False,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        target=target, remote=remote, build=build, clean=clean, jobs=jobs,
+        force_relay=force_relay, hex=hex_path, target_mcu=target_mcu,
+        config=config, verbose=verbose,
+    )
+
+
+class TestDeployRemoteArgparse:
+    def test_remote_flag_parses_and_defaults_to_false(self):
+        parser = cli_mod._build_parser()
+
+        assert parser.parse_args(["deploy"]).remote is False
+        assert parser.parse_args(["deploy", "togov", "--remote"]).remote is True
+
+    def test_remote_is_documented_in_deploy_help(self, capsys):
+        parser = cli_mod._build_parser()
+
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["deploy", "--help"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "--remote" in out
+
+
+class TestCmdDeployRemoteRejections:
+    """Acceptance criterion: both rejections fire before any network I/O."""
+
+    def test_dev_path_target_is_rejected_before_touching_mdns_or_network(
+        self, monkeypatch, capsys
+    ):
+        def _boom(*a, **k):
+            raise AssertionError("must not touch the network for a /dev/ target")
+
+        monkeypatch.setattr(remote_mod.mdns, "browse", _boom)
+        monkeypatch.setattr(remote_mod, "resolve_board", _boom)
+        monkeypatch.setattr(remote_mod, "deploy_over_network", _boom)
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target="/dev/ttyACM0"))
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "--remote cannot be combined with a device path" in captured.err
+        assert "/dev/ttyACM0" in captured.err
+
+    def test_any_slash_containing_target_is_rejected_too(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            remote_mod, "deploy_over_network",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("must not reach deploy_over_network")
+            ),
+        )
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target="some/path"))
+
+        assert rc == 1
+        assert "--remote cannot be combined" in capsys.readouterr().err
+
+    def test_no_target_is_rejected(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            remote_mod, "deploy_over_network",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("must not reach deploy_over_network")
+            ),
+        )
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target=None))
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "--remote requires a target" in captured.err
+
+    def test_neither_rejection_touches_local_devices_module(self, monkeypatch):
+        import mbdeploy.devices as devices_mod
+
+        def _boom(*a, **k):
+            raise AssertionError("a rejection must not probe local USB devices")
+
+        monkeypatch.setattr(devices_mod, "flashable_probes", _boom)
+        monkeypatch.setattr(devices_mod, "load_devices", _boom)
+
+        assert cli_mod._cmd_deploy(_deploy_remote_args(target="/dev/ttyACM0")) == 1
+        assert cli_mod._cmd_deploy(_deploy_remote_args(target=None)) == 1
+
+
+class TestCmdDeployRemoteDispatch:
+    def test_forwards_target_hex_path_and_target_mcu_and_force_relay(
+        self, monkeypatch
+    ):
+        calls = []
+        monkeypatch.setattr(
+            remote_mod, "deploy_over_network",
+            lambda target, hex_path, target_mcu, force_relay=False, timeout=2.0: (
+                calls.append((target, hex_path, target_mcu, force_relay)) or 0
+            ),
+        )
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(
+            target="togov", target_mcu="nrf52840", force_relay=True,
+            hex_path="custom.hex",
+        ))
+
+        assert rc == 0
+        assert calls == [("togov", "custom.hex", "nrf52840", True)]
+
+    def test_default_hex_path_used_when_not_given(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            remote_mod, "deploy_over_network",
+            lambda target, hex_path, target_mcu, force_relay=False, timeout=2.0: (
+                calls.append(hex_path) or 0
+            ),
+        )
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target="togov"))
+
+        assert rc == 0
+        assert calls == [cli_mod._DEFAULT_HEX]
+
+    def test_exit_code_mirrors_deploy_over_network_return_value(self, monkeypatch):
+        monkeypatch.setattr(remote_mod, "deploy_over_network", lambda *a, **k: 1)
+
+        assert cli_mod._cmd_deploy(_deploy_remote_args(target="togov")) == 1
+
+    def test_does_not_touch_local_devices_module(self, monkeypatch):
+        import mbdeploy.devices as devices_mod
+
+        def _boom(*a, **k):
+            raise AssertionError("deploy --remote must not touch local registry/USB")
+
+        monkeypatch.setattr(devices_mod, "load_devices", _boom)
+        monkeypatch.setattr(devices_mod, "flashable_probes", _boom)
+        monkeypatch.setattr(remote_mod, "deploy_over_network", lambda *a, **k: 0)
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target="togov"))
+
+        assert rc == 0
+
+
+class TestCmdDeployRemoteEndToEnd:
+    """Acceptance criterion, verbatim: `deploy --remote <name> --hex ...`
+    against a fake `_mbflash._tcp` server -- success path relays `LOG`
+    lines to stderr and returns 0 on `OK flashed`, driven through the
+    real `_cmd_deploy` handler rather than calling `deploy_over_network`
+    directly."""
+
+    def test_success_path_via_cmd_deploy_relays_log_and_exits_zero(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        payload = b":10000000FF00112233\n:00000001FF\n"
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(payload)
+
+        def handler(conn):
+            header = _srv_read_line(conn).decode()
+            conn.sendall(b"OK send\n")
+            m = re.match(r"FLASH (\d+)", header)
+            _srv_read_exact(conn, int(m.group(1)))
+            conn.sendall(b"LOG erasing\n")
+            conn.sendall(b"LOG programming\n")
+            conn.sendall(b"OK flashed\n")
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server, name="togov")
+            rc = cli_mod._cmd_deploy(
+                _deploy_remote_args(target="togov", hex_path=str(hex_path))
+            )
+        finally:
+            server.close()
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "erasing" in captured.err
+        assert "programming" in captured.err
+
+    def test_err_busy_via_cmd_deploy_exits_nonzero_with_message_on_stderr(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hex_path = tmp_path / "MICROBIT.hex"
+        hex_path.write_bytes(b"payload-bytes")
+
+        def handler(conn):
+            _srv_read_line(conn)
+            conn.sendall(b"ERR busy\n")
+
+        server = ScriptedFlashServer(handler)
+        server.start()
+        try:
+            _patch_resolve_to(monkeypatch, server, name="togov")
+            rc = cli_mod._cmd_deploy(
+                _deploy_remote_args(target="togov", hex_path=str(hex_path))
+            )
+        finally:
+            server.close()
+
+        assert rc != 0
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "busy" in captured.err
+
+
+class TestCmdDeployRemoteBuildRunsLocally:
+    """Acceptance criterion: --build/--clean still run locally, unchanged,
+    before the network exchange starts."""
+
+    def test_build_flag_calls_builder_run_before_deploy_over_network(
+        self, monkeypatch
+    ):
+        import mbdeploy.builder as builder_mod
+
+        build_calls = []
+        monkeypatch.setattr(
+            builder_mod, "run",
+            lambda clean, verbose, jobs: build_calls.append(
+                {"clean": clean, "verbose": verbose, "jobs": jobs}
+            ) or 0,
+        )
+        deploy_calls = []
+        monkeypatch.setattr(
+            remote_mod, "deploy_over_network",
+            lambda *a, **k: deploy_calls.append(1) or 0,
+        )
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target="togov", build=True))
+
+        assert rc == 0
+        assert len(build_calls) == 1
+        assert build_calls[0]["clean"] is False
+        assert len(deploy_calls) == 1
+
+    def test_clean_flag_also_triggers_a_local_build(self, monkeypatch):
+        import mbdeploy.builder as builder_mod
+
+        build_calls = []
+        monkeypatch.setattr(
+            builder_mod, "run",
+            lambda clean, verbose, jobs: build_calls.append(clean) or 0,
+        )
+        monkeypatch.setattr(remote_mod, "deploy_over_network", lambda *a, **k: 0)
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target="togov", clean=True))
+
+        assert rc == 0
+        assert build_calls == [True]
+
+    def test_no_build_or_clean_skips_builder_entirely(self, monkeypatch):
+        import mbdeploy.builder as builder_mod
+
+        def _boom(**k):
+            raise AssertionError("must not build when neither flag is given")
+
+        monkeypatch.setattr(builder_mod, "run", _boom)
+        monkeypatch.setattr(remote_mod, "deploy_over_network", lambda *a, **k: 0)
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target="togov"))
+
+        assert rc == 0
+
+    def test_build_failure_short_circuits_before_the_network_exchange(
+        self, monkeypatch, capsys
+    ):
+        import mbdeploy.builder as builder_mod
+
+        monkeypatch.setattr(builder_mod, "run", lambda clean, verbose, jobs: 7)
+
+        def _boom(*a, **k):
+            raise AssertionError("must not reach the network after a failed build")
+
+        monkeypatch.setattr(remote_mod, "deploy_over_network", _boom)
+
+        rc = cli_mod._cmd_deploy(_deploy_remote_args(target="togov", build=True))
+
+        assert rc == 7
+        assert "build failed" in capsys.readouterr().err

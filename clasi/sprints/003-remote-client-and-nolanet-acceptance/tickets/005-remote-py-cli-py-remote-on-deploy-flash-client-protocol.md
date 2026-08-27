@@ -1,9 +1,12 @@
 ---
 id: '005'
 title: 'remote.py + cli.py: --remote on deploy (FLASH client protocol)'
-status: open
-use-cases: [SUC-012, SUC-013]
-depends-on: ['002']
+status: in-progress
+use-cases:
+- SUC-012
+- SUC-013
+depends-on:
+- '002'
 github-issue: ''
 issue: mbdeploy-serve-a-network-facing-micro-bit-fleet-daemon.md
 completes_issue: true
@@ -44,24 +47,26 @@ preserving the 0-is-success contract in agent manual §5.
 
 ## Acceptance Criteria
 
-- [ ] `deploy --remote /dev/ttyACM0 ...` and `deploy --remote` (no
+- [x] `deploy --remote /dev/ttyACM0 ...` and `deploy --remote` (no
       target) are both rejected before any network I/O.
-- [ ] `deploy --remote <name> --hex ...` against a fake `_mbflash._tcp`
+- [x] `deploy --remote <name> --hex ...` against a fake `_mbflash._tcp`
       server: success path relays `LOG` lines to stderr and returns 0
       on `OK flashed`.
-- [ ] Each of `ERR busy` / `ERR relay refused — send force-relay` /
+- [x] Each of `ERR busy` / `ERR relay refused — send force-relay` /
       `ERR flash disabled` / `ERR sha256 mismatch` / `ERR short payload`
       / `ERR auth required` maps to a non-zero exit with the server's
       message visible on stderr.
-- [ ] `--build`/`--clean` still run locally, unchanged, before the
+- [x] `--build`/`--clean` still run locally, unchanged, before the
       network exchange starts — verified by asserting the local
       `builder.run` call happens even when `--remote` is set.
-- [ ] `--force-relay` is forwarded as the `force-relay` token on the
+- [x] `--force-relay` is forwarded as the `force-relay` token on the
       wire only when the flag is given.
-- [ ] Local `deploy <target>` (no `--remote`) is byte-for-byte
+- [x] Local `deploy <target>` (no `--remote`) is byte-for-byte
       unaffected.
 - [ ] On real Nolanet hardware (validated in ticket 009):
       `deploy --remote togov --hex MICROBIT.hex` flashes and exits 0.
+      (Deferred, as noted — this is ticket 009's own acceptance
+      signal, not retestable here without real hardware.)
 
 ## Testing
 
@@ -75,3 +80,38 @@ preserving the 0-is-success contract in agent manual §5.
   on `builder.run`).
 - **Verification command**: `uv run pytest tests/test_remote.py
   tests/test_devices.py`
+
+## Implementation Notes
+
+- **`--token`/`AUTH` client support is not in this ticket's scope**,
+  same conclusion ticket 004 reached for `connect --remote` and for the
+  same reason: this ticket's own Description/Acceptance Criteria never
+  ask for a `--token` flag on `deploy`'s subparser or for
+  `deploy_over_network` to send an `AUTH ...` line. `ERR auth required`
+  is still handled correctly without any of that: `deploy_over_network`
+  never sends `AUTH`, so against a token-gated `serve_flash`, the first
+  line back in reply to `FLASH ...` is `ERR auth required` instead of
+  `OK send` — already covered by the generic "anything other than
+  `OK send` is the final `ERR ...`" branch the Description's own step 3
+  specifies, with no special-case code needed.
+- `deploy_over_network` does its own `Error: ...`/stderr printing and
+  returns the exit code directly (rather than raising and leaving
+  `_cmd_deploy` to catch/format), matching sprint.md's Step 5 wording
+  ("maps `OK flashed` → exit 0, any `ERR ...` → exit 1") and letting
+  `_cmd_deploy`'s remote branch be a single `return
+  remote_mod.deploy_over_network(...)` with nothing left to catch.
+- Socket reads after connecting use a generous, per-*line* timeout
+  (`remote._FLASH_READ_TIMEOUT`, 30s, mirroring `server.PAYLOAD_TIMEOUT`
+  in magnitude) rather than one deadline for the whole exchange — a real
+  flash can pause between `LOG` lines during erase/verify, so only a
+  connection that goes genuinely silent for that long (or is closed)
+  is treated as a failure, not slow-but-progressing output.
+- Tested at three layers: `ScriptedFlashServer` (a real loopback socket
+  scripted per test) for the success path, each named `ERR`, the
+  force-relay/sha256 header fields, and a bounded-timeout truncated
+  exchange; `TestDeployOverNetworkAgainstRealServeFlash`, which runs the
+  client against the actual `server.serve_flash` handler with only
+  `flash_hex` stubbed, proving both sides agree on the wire format; and
+  `_cmd_deploy`'s own `--remote` branch (rejections, forwarding,
+  build/clean-still-local, and one end-to-end run through a scripted
+  server).

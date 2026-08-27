@@ -27,16 +27,24 @@ This ticket lands two of that boundary's pieces:
   it is recovered from the leading label of ``mdns.browse()``'s own
   ``name`` field, because ``mdns.Advertiser.register`` names every
   ``ServiceInfo`` ``f"{name}.{service_type}"``.
-
-``list_remote`` and ``deploy_over_network`` (sprint.md Step 3's other two
-``remote.py`` responsibilities, R1's sibling and R3) are later tickets'
-scope, not this one's.
+- :func:`list_remote` (ticket 003) — browses both service types and
+  groups the results into one row per board for ``list --remote``.
+- :func:`deploy_over_network` (ticket 005) — the client side of
+  ``server.py::serve_flash``'s ``FLASH``/``LOG``/``OK``/``ERR`` wire
+  protocol: resolves the board via :func:`resolve_board`, sends the hex
+  payload with its sha256, relays ``LOG`` lines to stderr as they
+  arrive, and turns the server's terminal line into a process-style exit
+  code (``OK flashed`` -> 0, any ``ERR ...`` -> 1) for ``deploy
+  --remote`` to return directly.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 import socket
+import sys
+from pathlib import Path
 
 from mbdeploy import console, mdns
 
@@ -369,3 +377,172 @@ def list_remote(timeout: float = 2.0) -> list[dict]:
     rows = [grouped[key] for key in order]
     rows.sort(key=lambda r: (r["name"], r["uid"]))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# deploy_over_network -- the FLASH client protocol
+# ---------------------------------------------------------------------------
+
+#: Socket read timeout applied once connected, for every line this module
+#: reads back from `serve_flash` (the header response, each `LOG` line,
+#: and the terminal `OK flashed`/`ERR ...` line). Deliberately generous
+#: and per-*line*, not an overall deadline for the whole exchange: a real
+#: flash can legitimately pause between `LOG` lines during erase/verify,
+#: so this only has to catch a connection that has gone genuinely silent
+#: (or a test's scripted stall), not bound how long flashing itself may
+#: take. Matches `server.py`'s own `PAYLOAD_TIMEOUT` in magnitude and
+#: reasoning, applied to the client's side of the same exchange.
+_FLASH_READ_TIMEOUT = 30.0
+
+
+def _read_line(sock: socket.socket, max_len: int = 65536) -> str | None:
+    """Read one ``\\n``-terminated line from ``sock``, decoded as UTF-8.
+
+    Returns the line without its trailing newline, or ``None`` on EOF (the
+    peer closed the connection) or a read timeout (whatever timeout
+    ``sock`` currently has set) before a full line arrived -- either way
+    an unambiguous "no terminal line" signal, so a truncated exchange
+    becomes a definite error rather than a hang. Reads one byte at a time,
+    mirroring `server.py::_read_line`'s own reasoning: this module's
+    protocol reads are always short header/log/result lines, so the extra
+    syscalls cost nothing worth avoiding, and the pattern stays identical
+    to the wire peer it's reading from.
+    """
+    buf = bytearray()
+    while True:
+        try:
+            b = sock.recv(1)
+        except (socket.timeout, OSError):
+            return None
+        if not b:
+            return None
+        if b == b"\n":
+            return buf.decode("utf-8", "replace")
+        buf.extend(b)
+        if len(buf) > max_len:
+            return None
+
+
+def _strip_err_prefix(line: str) -> str:
+    """Drop a leading ``"ERR "`` so the message prints once, not as a
+    doubled ``"Error: ERR ..."``. A line that isn't `ERR`-prefixed at all
+    should not happen per the protocol, but is passed through unchanged
+    rather than assumed away.
+    """
+    return line[len("ERR "):] if line.startswith("ERR ") else line
+
+
+def deploy_over_network(
+    name: str,
+    hex_path: str,
+    target_mcu: str,
+    force_relay: bool = False,
+    timeout: float = 2.0,
+) -> int:
+    """Flash ``hex_path`` to the board named ``name`` over `_mbflash._tcp`.
+
+    Speaks `server.py::serve_flash`'s wire protocol as a client:
+    :func:`resolve_board` the name, connect, send
+    ``FLASH <nbytes> sha256=<hex>[ force-relay]``, send the payload once
+    the server replies ``OK send``, then read lines until a terminal one
+    -- relaying every ``LOG <text>`` line to stderr as it arrives (so a
+    multi-second flash shows progress, not silence-then-result) -- and
+    return ``0`` on ``OK flashed`` or ``1`` on anything else, including
+    every named ``ERR ...`` `serve_flash` can send (``busy``, ``relay
+    refused``, ``flash disabled``, ``sha256 mismatch``, ``short
+    payload``, ``auth required``) and a response to the initial header
+    that isn't literally ``OK send`` (the same case an auth-gated server
+    without a matching `AUTH` handshake produces: `serve_flash` sends
+    ``ERR auth required`` as the very first line back, in place of
+    ``OK send``).
+
+    ``target_mcu`` is accepted for call-site symmetry with the local
+    ``flash_mod.flash_hex`` this replaces in `deploy --remote` -- the
+    daemon already knows its own board's MCU (`serve`'s own
+    ``--target-mcu``), so nothing here is sent on the wire; this
+    function never needs it beyond the parameter itself.
+
+    Every failure -- resolution, connection, a truncated/EOF exchange, or
+    any non-success terminal line -- prints one ``Error: ...`` line to
+    stderr and returns ``1``, the same "print and return non-zero"
+    contract every other pre-flight rejection in this codebase already
+    uses (``_deploy_entry``, ``_connect_port``), so ``deploy --remote``
+    can forward this return value directly as its own exit code (agent
+    manual §5's 0-is-success contract) with nothing left for the caller
+    to catch.
+
+    ``sha256`` is always sent, computed over exactly the bytes read from
+    ``hex_path`` -- `serve_flash` already verifies it whenever present,
+    so the marginal cost of one hash call catches in-transit corruption
+    on every remote flash, not only when a caller remembers to ask for it.
+    """
+    try:
+        board = resolve_board(name, FLASH_SERVICE_TYPE, timeout)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        payload = Path(hex_path).read_bytes()
+    except OSError as exc:
+        print(f"Error: cannot read '{hex_path}': {exc}", file=sys.stderr)
+        return 1
+
+    digest = hashlib.sha256(payload).hexdigest()
+    host, port = board["host"], board["port"]
+    label = f"{board['name']} ({host}:{port})"
+
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError as exc:
+        print(f"Error: cannot connect to {label}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        sock.settimeout(_FLASH_READ_TIMEOUT)
+
+        header = f"FLASH {len(payload)} sha256={digest}"
+        if force_relay:
+            header += " force-relay"
+        try:
+            sock.sendall((header + "\n").encode("utf-8"))
+        except OSError as exc:
+            print(f"Error: cannot reach {label}: {exc}", file=sys.stderr)
+            return 1
+
+        line = _read_line(sock)
+        if line is None:
+            print(
+                f"Error: no response from {label} (connection closed or timed "
+                "out) while waiting for a reply to FLASH.",
+                file=sys.stderr,
+            )
+            return 1
+        if line != "OK send":
+            print(f"Error: {_strip_err_prefix(line)}", file=sys.stderr)
+            return 1
+
+        try:
+            sock.sendall(payload)
+        except OSError as exc:
+            print(f"Error: cannot send payload to {label}: {exc}", file=sys.stderr)
+            return 1
+
+        while True:
+            line = _read_line(sock)
+            if line is None:
+                print(
+                    f"Error: no response from {label} (connection closed or "
+                    "timed out) before the flash finished.",
+                    file=sys.stderr,
+                )
+                return 1
+            if line.startswith("LOG "):
+                print(line[len("LOG "):], file=sys.stderr)
+                continue
+            if line == "OK flashed":
+                return 0
+            print(f"Error: {_strip_err_prefix(line)}", file=sys.stderr)
+            return 1
+    finally:
+        sock.close()
