@@ -567,6 +567,221 @@ class TestProbeClear:
 
 
 # ---------------------------------------------------------------------------
+# probe_type — announcement dialect parsing (ticket 001/003)
+#
+# Commit 2e19088 taught probe_type a second, space-delimited announcement
+# dialect alongside the original colon form, and shipped with zero tests
+# (suite was 92 before and 92 after). Every prior reference to probe_type
+# in this file monkeypatches it away, so neither dialect had ever actually
+# been exercised. These tests drive the real function against a fake
+# serial.Serial instead.
+# ---------------------------------------------------------------------------
+
+class _ScriptedProbePort:
+    """Minimal serial.Serial stand-in for exactly the calls probe_type makes.
+
+    test_connect.py's FakeSerial is built for the interactive `connect` read
+    loop and doesn't implement `.open()` or pre-exist the modem-control
+    attributes (`.port`, `.dtr`, `.rts`) that probe_type sets *before*
+    opening -- so this is a second, smaller fake local to this file rather
+    than a fork of that one.
+    """
+
+    def __init__(self, lines: tuple[bytes, ...] = ()):
+        self._lines = list(lines)
+        self.is_open = False
+        self.port = None
+        self.dtr = None
+        self.rts = None
+        self.written = b""
+        self.reset_count = 0
+
+    def open(self):
+        self.is_open = True
+
+    def reset_input_buffer(self):
+        self.reset_count += 1
+
+    def write(self, data):
+        self.written += data
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def readline(self):
+        if self._lines:
+            return self._lines.pop(0)
+        return b""
+
+    def close(self):
+        self.is_open = False
+
+
+def _patch_serial(monkeypatch, *lines: bytes) -> _ScriptedProbePort:
+    """Monkeypatch devices_mod.serial.Serial to hand back a scripted port."""
+    port = _ScriptedProbePort(lines)
+    monkeypatch.setattr(devices_mod.serial, "Serial", lambda **kwargs: port)
+    return port
+
+
+class TestProbeType:
+    """probe_type against a fake serial port, both announcement dialects."""
+
+    @pytest.fixture(autouse=True)
+    def _no_powerup_delay(self, monkeypatch):
+        # probe_type sleeps 0.3s after open() to let real hardware settle
+        # before reading. That's not what these tests exercise, so skip the
+        # wall-clock wait -- time.time() (and therefore the read deadline)
+        # is left untouched.
+        monkeypatch.setattr(devices_mod.time, "sleep", lambda _s: None)
+
+    def test_colon_dialect_parses_five_fields(self, monkeypatch):
+        _patch_serial(monkeypatch, b"DEVICE:RADIOBRIDGE:relay:getez:1779042496\n")
+        result = devices_mod.probe_type("/dev/fake")
+        assert result == {
+            "role": "RADIOBRIDGE",
+            "common_name": "relay",
+            "device_name": "getez",
+            "serial": "1779042496",
+            "raw": "DEVICE:RADIOBRIDGE:relay:getez:1779042496",
+        }
+
+    def test_space_dialect_parses_same_five_fields(self, monkeypatch):
+        _patch_serial(monkeypatch, b"device NEZHA2 robot vevov 1198504156\n")
+        result = devices_mod.probe_type("/dev/fake")
+        assert result == {
+            "role": "NEZHA2",
+            "common_name": "robot",
+            "device_name": "vevov",
+            "serial": "1198504156",
+            "raw": "device NEZHA2 robot vevov 1198504156",
+        }
+
+    def test_colon_dialect_rejoins_serial_containing_colons(self, monkeypatch):
+        # Serial itself contains ':' -- 8 colon-delimited parts total, so
+        # the parser must rejoin everything past the 4th on ':'.
+        line = b"DEVICE:RADIOBRIDGE:relay:getez:17:79:04:2496\n"
+        _patch_serial(monkeypatch, line)
+        result = devices_mod.probe_type("/dev/fake")
+        assert result == {
+            "role": "RADIOBRIDGE",
+            "common_name": "relay",
+            "device_name": "getez",
+            "serial": "17:79:04:2496",
+            "raw": "DEVICE:RADIOBRIDGE:relay:getez:17:79:04:2496",
+        }
+
+    def test_space_dialect_ignores_extra_trailing_tokens(self, monkeypatch):
+        line = b"device NEZHA2 robot vevov 1198504156 extra_token\n"
+        _patch_serial(monkeypatch, line)
+        result = devices_mod.probe_type("/dev/fake")
+        assert result == {
+            "role": "NEZHA2",
+            "common_name": "robot",
+            "device_name": "vevov",
+            "serial": "1198504156",
+            "raw": "device NEZHA2 robot vevov 1198504156 extra_token",
+        }
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b"DEVICE:RADIOBRIDGE:relay:getez\n",   # colon: 4 fields, no serial
+            b"DEVICE:RADIOBRIDGE\n",                # colon: 2 fields
+            b"device NEZHA2 robot vevov\n",          # space: 4 tokens, no serial
+            b"device NEZHA2\n",                      # space: 2 tokens
+        ],
+    )
+    def test_incomplete_banner_returns_none(self, monkeypatch, line):
+        _patch_serial(monkeypatch, line)
+        assert devices_mod.probe_type("/dev/fake", timeout_s=0.05) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b"ver 1.2.3\n",   # a ver reply, not an announcement
+            b"status OK\n",   # a status reply, not an announcement
+            b"\n",            # an empty line
+        ],
+    )
+    def test_non_announcement_reply_returns_none(self, monkeypatch, line):
+        _patch_serial(monkeypatch, line)
+        assert devices_mod.probe_type("/dev/fake", timeout_s=0.05) is None
+
+    def test_silent_port_returns_none(self, monkeypatch):
+        """No reply at all (port busy / no firmware / timed out)."""
+        _patch_serial(monkeypatch)  # readline() always yields b""
+        assert devices_mod.probe_type("/dev/fake", timeout_s=0.05) is None
+
+
+# ---------------------------------------------------------------------------
+# probe_all -- preserve prior announcement fields when probe_type -> None
+# ---------------------------------------------------------------------------
+
+class TestProbeAllPreservesAnnouncementOnNone:
+    """probe_all must not clobber role/common_name/device_name/serial/
+    announcement when probe_type can't produce a fresh reading.
+
+    This is the exact gap that let a robot announcement silently fail to
+    update `role`: before the space dialect was accepted, a robot's HELLO
+    reply always failed to parse, probe_type always returned None, and
+    probe_all always took this preserve-existing-fields branch -- so a
+    board reflashed from relay to robot firmware kept showing its old
+    RADIOBRIDGE role indefinitely (see the incident note in probe_type's
+    docstring comment block, devices.py:160-169).
+    """
+
+    _STALE_ENTRY = {
+        "uid": _DEVICE_UID,
+        "enum": 2,
+        "port": "/dev/cu.device1",
+        "role": "RADIOBRIDGE",
+        "common_name": "relay1",
+        "device_name": "vevov",
+        "serial": "1779042496",
+        "announcement": "DEVICE:RADIOBRIDGE:relay1:vevov:1779042496",
+    }
+
+    def _run(self, monkeypatch, tmp_path):
+        config = tmp_path / "devices.json"
+        config.write_text(json.dumps({_DEVICE_UID: self._STALE_ENTRY.copy()}))
+
+        monkeypatch.setattr(
+            devices_mod, "flashable_probes",
+            lambda: [{"uid": _DEVICE_UID, "description": "dev"}],
+        )
+        monkeypatch.setattr(
+            devices_mod, "port_serial_map",
+            lambda known: {_DEVICE_UID: "/dev/cu.device1"},
+        )
+        monkeypatch.setattr(devices_mod, "read_device_id", lambda uid, mcu: None)
+
+        entries = devices_mod.probe_all(config)
+        return entries[0]
+
+    def _assert_preserved(self, entry):
+        assert entry["role"] == "RADIOBRIDGE"
+        assert entry["common_name"] == "relay1"
+        assert entry["device_name"] == "vevov"
+        assert entry["serial"] == "1779042496"
+        assert entry["announcement"] == "DEVICE:RADIOBRIDGE:relay1:vevov:1779042496"
+
+    def test_preserved_when_port_gives_no_reply_at_all(self, monkeypatch, tmp_path):
+        """Silent port (timed out / no firmware) -- probe_type returns None."""
+        monkeypatch.setattr(devices_mod, "probe_type", lambda port: None)
+        self._assert_preserved(self._run(monkeypatch, tmp_path))
+
+    def test_preserved_when_reply_does_not_parse(self, monkeypatch, tmp_path):
+        """A reply arrived but wasn't a DEVICE:/device announcement (e.g. a
+        'ver' or 'status' line, or a truncated banner) -- probe_type also
+        returns None here, indistinguishable from silence at this seam.
+        """
+        monkeypatch.setattr(devices_mod, "probe_type", lambda port: None)
+        self._assert_preserved(self._run(monkeypatch, tmp_path))
+
+
+# ---------------------------------------------------------------------------
 # deploy — auto-pick
 # ---------------------------------------------------------------------------
 
