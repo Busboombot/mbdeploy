@@ -188,7 +188,7 @@ class LoopbackServer:
     once it has seen enough of what the client sent.
     """
 
-    def __init__(self, on_receive=None) -> None:
+    def __init__(self, on_receive=None, immediate_send: bytes | None = None) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
@@ -197,6 +197,11 @@ class LoopbackServer:
         self.conn: socket.socket | None = None
         self.received = bytearray()
         self._on_receive = on_receive
+        # Sent immediately on accept, then the connection is closed without
+        # ever entering the recv loop -- stands in for `serve_serial`'s own
+        # pre-relay `ERR ...` line (e.g. `ERR busy`), which is always
+        # followed by the daemon closing the connection.
+        self._immediate_send = immediate_send
         self._lock = threading.Lock()
         self._accepted = threading.Event()
         self._stop = threading.Event()
@@ -213,6 +218,12 @@ class LoopbackServer:
             return
         self.conn = conn
         self._accepted.set()
+        if self._immediate_send is not None:
+            try:
+                conn.sendall(self._immediate_send)
+            finally:
+                conn.close()
+            return
         conn.settimeout(0.1)
         while not self._stop.is_set():
             try:
@@ -760,3 +771,260 @@ class TestPrintDeviceTableLocalOutputUnchanged:
         assert "CONN" in default_out
         assert "PORT" in default_out
         assert "HOST" not in default_out
+
+
+# ---------------------------------------------------------------------------
+# `connect --remote` wiring: cli._cmd_connect's remote branch
+#
+# Ticket 004. Both `console.send_command` (one-shot) and `console.interact`
+# (interactive, in_waiting-driven) run against `remote.SocketSerial` through
+# the actual `_cmd_connect` handler here, against a real loopback socket
+# standing in for `serve_serial` -- not just the adapter in isolation
+# (that's TestConsoleUnchangedAgainstSocketSerial above).
+# ---------------------------------------------------------------------------
+
+
+def _connect_remote_args(
+    target, message=(), remote=True, baud=115200, timeout=1.0, config=None
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        target=target, message=list(message), remote=remote,
+        baud=baud, timeout=timeout, config=config,
+    )
+
+
+class TestConnectRemoteArgparse:
+    def test_remote_flag_parses_and_defaults_to_false(self):
+        parser = cli_mod._build_parser()
+
+        assert parser.parse_args(["connect", "togov"]).remote is False
+        assert parser.parse_args(["connect", "--remote", "togov"]).remote is True
+
+    def test_remote_is_documented_in_connect_help(self, capsys):
+        parser = cli_mod._build_parser()
+
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["connect", "--help"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "--remote" in out
+        assert "ignored" in out.lower()  # --baud's note about --remote
+
+    def test_remote_and_baud_combine_at_parse_time_without_error(self):
+        """argparse itself never rejects --remote+--baud -- --baud is simply
+        ignored by the handler, so the parser has no reason to refuse it."""
+        parser = cli_mod._build_parser()
+
+        args = parser.parse_args(["connect", "--remote", "--baud", "9600", "togov"])
+
+        assert args.remote is True
+        assert args.baud == 9600
+
+
+class TestCmdConnectRemoteRejectsDevicePath:
+    """Acceptance criterion: rejected before any mDNS lookup or socket I/O."""
+
+    def test_dev_path_is_rejected_before_touching_mdns(self, monkeypatch, capsys):
+        def _boom(*a, **k):
+            raise AssertionError("must not touch mdns.browse for a /dev/ target")
+
+        monkeypatch.setattr(remote_mod.mdns, "browse", _boom)
+
+        rc = cli_mod._cmd_connect(_connect_remote_args("/dev/ttyACM0", ["HELLO"]))
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert (
+            "--remote cannot be combined with a device path" in captured.err
+        )
+        assert "/dev/ttyACM0" in captured.err
+
+    def test_any_slash_containing_target_is_rejected_too(self, monkeypatch, capsys):
+        """Matches `_connect_port`'s own existing test: a bare '/' counts,
+        not only a literal /dev/ prefix."""
+
+        def _boom(*a, **k):
+            raise AssertionError("must not touch mdns.browse for a path-like target")
+
+        monkeypatch.setattr(remote_mod.mdns, "browse", _boom)
+
+        rc = cli_mod._cmd_connect(_connect_remote_args("some/path", []))
+
+        assert rc == 1
+        assert "--remote cannot be combined" in capsys.readouterr().err
+
+    def test_local_connect_with_a_dev_path_is_unaffected(self, monkeypatch):
+        """Without --remote, a /dev/... target is still opened verbatim --
+        this ticket must not touch that behavior."""
+        assert cli_mod._connect_port("/dev/cu.usbmodem99", {}) == "/dev/cu.usbmodem99"
+
+
+class TestCmdConnectRemote:
+    """`_cmd_connect`'s --remote branch, against a real loopback TCP server
+    standing in for `serve_serial`."""
+
+    @pytest.fixture(autouse=True)
+    def _fast_err_peek(self, monkeypatch):
+        # The ERR-busy peek defaults to 0.3s; tests don't need to pay that
+        # unless they are specifically exercising the busy path.
+        monkeypatch.setattr(cli_mod, "_REMOTE_ERR_PEEK_TIMEOUT", 0.05)
+
+    def _patch_resolve(self, monkeypatch, server: LoopbackServer, name="togov"):
+        monkeypatch.setattr(
+            remote_mod, "resolve_board",
+            lambda target, service_type, timeout=2.0: {
+                "name": name, "host": "127.0.0.1", "port": server.port, "txt": {},
+            },
+        )
+
+    def test_one_shot_exchange_returns_reply_on_stdout_and_exits_zero(
+        self, monkeypatch, capsys
+    ):
+        def on_receive(conn, chunk):
+            if b"\n" in chunk:
+                conn.sendall(b"PONG\n")
+
+        server = LoopbackServer(on_receive=on_receive)
+        server.start()
+        try:
+            self._patch_resolve(monkeypatch, server)
+            rc = cli_mod._cmd_connect(
+                _connect_remote_args("togov", ["HELLO"], timeout=2.0)
+            )
+        finally:
+            server.close()
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out == "PONG\n"          # reply only -- no banner on stdout
+        assert server.wait_until_received(b"HELLO\n") == b"HELLO\n"
+
+    def test_silent_board_exits_one_with_no_response_on_stderr(
+        self, monkeypatch, capsys
+    ):
+        server = LoopbackServer()
+        server.start()
+        try:
+            self._patch_resolve(monkeypatch, server)
+            rc = cli_mod._cmd_connect(
+                _connect_remote_args("togov", ["HELLO"], timeout=0.3)
+            )
+        finally:
+            server.close()
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "no response" in captured.err
+
+    def test_interactive_path_relays_both_directions_via_in_waiting(
+        self, monkeypatch
+    ):
+        """The path a missing/broken in_waiting would break silently --
+        driven here through the real _cmd_connect handler, not just the
+        adapter directly."""
+        server = LoopbackServer()
+        server.start()
+        fake_in = FakeStdin(["PING\n"])
+        fake_out = FakeStdout()
+        monkeypatch.setattr(console_mod.sys, "stdin", fake_in)
+        monkeypatch.setattr(console_mod.sys, "stdout", fake_out)
+        monkeypatch.setattr(console_mod, "EOF_DRAIN", 0.3)
+
+        def push_reply():
+            server.wait_for_connection()
+            time.sleep(0.05)             # let the reader thread start polling
+            server.conn.sendall(b"board says hi\n")
+
+        pusher = threading.Thread(target=push_reply, daemon=True)
+        pusher.start()
+        try:
+            self._patch_resolve(monkeypatch, server)
+            rc = cli_mod._cmd_connect(_connect_remote_args("togov", [], timeout=1.0))
+        finally:
+            pusher.join(timeout=2.0)
+            server.close()
+
+        assert rc == 0
+        assert "board says hi" in fake_out.getvalue()
+        assert server.wait_until_received(b"PING\n") == b"PING\n"
+
+    def test_resolve_board_failure_surfaces_as_error_and_exit_one(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            remote_mod, "resolve_board",
+            lambda *a, **k: (_ for _ in ()).throw(
+                ValueError(
+                    "no board named 'nope' found advertising "
+                    f"{SERVICE_TYPE}"
+                )
+            ),
+        )
+
+        rc = cli_mod._cmd_connect(_connect_remote_args("nope", ["HELLO"]))
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("Error: ")
+        assert "no board named 'nope'" in captured.err
+
+    def test_err_busy_surfaces_cleanly_as_error_not_garbage_reply(
+        self, monkeypatch, capsys
+    ):
+        server = LoopbackServer(immediate_send=b"ERR busy\n")
+        server.start()
+        try:
+            self._patch_resolve(monkeypatch, server)
+            rc = cli_mod._cmd_connect(
+                _connect_remote_args("togov", ["HELLO"], timeout=1.0)
+            )
+        finally:
+            server.close()
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""                # never leaks into the reply
+        assert "busy" in captured.err
+
+    def test_err_busy_surfaces_cleanly_on_the_interactive_path_too(
+        self, monkeypatch, capsys
+    ):
+        server = LoopbackServer(immediate_send=b"ERR busy\n")
+        server.start()
+        try:
+            self._patch_resolve(monkeypatch, server)
+            rc = cli_mod._cmd_connect(_connect_remote_args("togov", [], timeout=1.0))
+        finally:
+            server.close()
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "busy" in captured.err
+
+    def test_connection_refused_surfaces_as_error_and_exit_one(
+        self, monkeypatch, capsys
+    ):
+        """No listener at all on the resolved host:port -- resolve_board
+        found a stale/incorrect mDNS entry, or the daemon just went down."""
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()                  # nothing listening on `port` now
+
+        monkeypatch.setattr(
+            remote_mod, "resolve_board",
+            lambda *a, **k: {
+                "name": "togov", "host": "127.0.0.1", "port": port, "txt": {},
+            },
+        )
+
+        rc = cli_mod._cmd_connect(_connect_remote_args("togov", ["HELLO"]))
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Error: cannot connect to" in captured.err
