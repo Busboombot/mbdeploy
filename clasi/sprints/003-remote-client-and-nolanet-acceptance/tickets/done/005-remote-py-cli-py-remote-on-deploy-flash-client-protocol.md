@@ -1,7 +1,7 @@
 ---
 id: '005'
 title: 'remote.py + cli.py: --remote on deploy (FLASH client protocol)'
-status: in-progress
+status: done
 use-cases:
 - SUC-012
 - SUC-013
