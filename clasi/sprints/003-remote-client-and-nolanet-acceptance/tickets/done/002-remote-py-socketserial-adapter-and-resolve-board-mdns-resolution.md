@@ -1,7 +1,7 @@
 ---
 id: '002'
 title: 'remote.py: SocketSerial adapter and resolve_board() mDNS resolution'
-status: in-progress
+status: done
 use-cases:
 - SUC-011
 depends-on: []
