@@ -15,6 +15,7 @@ be piped without the banner contaminating the data.
 
 from __future__ import annotations
 
+import socket
 import sys
 import threading
 import time
@@ -132,3 +133,54 @@ def interact(ser) -> int:
         stop.set()
         reader.join(timeout=1.0)
     return 0
+
+
+def relay_socket(ser, conn, stop: threading.Event) -> None:
+    """Relay bytes between ``ser`` and the connected socket ``conn``.
+
+    The network-facing sibling of :func:`interact`: same two-thread shape
+    (one daemon reader thread plus the caller's own loop), but a raw byte
+    pipe in both directions instead of a decoded stdin/stdout terminal —
+    no line buffering, no decoding, no :data:`EOF_DRAIN` grace period.
+
+    Returns when either side closes (socket EOF, a serial read/write error)
+    or when ``stop`` is set — including from another thread, which is how
+    ``serve_flash`` preempts a live session.  Neither ``ser`` nor ``conn`` is
+    closed here; that stays the caller's responsibility.
+    """
+
+    def _pump() -> None:
+        while not stop.is_set():
+            try:
+                data = ser.read(max(1, ser.in_waiting))
+            except Exception:
+                stop.set()          # port went away; wake the main loop too
+                break
+            if data:
+                try:
+                    conn.sendall(data)
+                except Exception:
+                    stop.set()      # socket went away; wake the main loop too
+                    break
+
+    reader = threading.Thread(target=_pump, name="mbdeploy-relay-read", daemon=True)
+    reader.start()
+    try:
+        conn.settimeout(READ_TIMEOUT)
+        while not stop.is_set():
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                continue            # just a poll interval; re-check stop
+            except Exception:
+                break               # socket went away
+            if not data:
+                break               # clean EOF: the peer disconnected
+            try:
+                ser.write(data)
+                ser.flush()
+            except Exception:
+                break               # port went away
+    finally:
+        stop.set()
+        reader.join(timeout=1.0)
