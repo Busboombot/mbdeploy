@@ -2,7 +2,7 @@
 id: '001'
 title: Port port_serial_map off ioreg onto pyserial, and fix the now-false ioreg error
   path
-status: in-progress
+status: done
 use-cases:
 - UC-001
 - UC-002
