@@ -1,8 +1,9 @@
 ---
 id: '002'
 title: 'remote.py: SocketSerial adapter and resolve_board() mDNS resolution'
-status: open
-use-cases: [SUC-011]
+status: in-progress
+use-cases:
+- SUC-011
 depends-on: []
 github-issue: ''
 issue: mbdeploy-serve-a-network-facing-micro-bit-fleet-daemon.md
@@ -43,22 +44,22 @@ adapter. Do not fork or wrap `send_command`/`interact`.
 
 ## Acceptance Criteria
 
-- [ ] `SocketSerial` implements `reset_input_buffer`, `write`, `flush`,
+- [x] `SocketSerial` implements `reset_input_buffer`, `write`, `flush`,
       `readline`, `read`, and `in_waiting` against a real (loopback)
       `socket.socket`.
-- [ ] `console.send_command(SocketSerial(...), ...)` works unchanged
+- [x] `console.send_command(SocketSerial(...), ...)` works unchanged
       against a real loopback server that behaves like `serve_serial`.
-- [ ] `console.interact(SocketSerial(...))` works unchanged against the
+- [x] `console.interact(SocketSerial(...))` works unchanged against the
       same kind of loopback server, exercising the `in_waiting`-driven
       read path specifically (a test that only calls `readline` would
       not catch a missing/broken `in_waiting`).
-- [ ] `resolve_board` returns the single matching `{name, host, port,
+- [x] `resolve_board` returns the single matching `{name, host, port,
       txt}`-shaped dict when exactly one board matches.
-- [ ] `resolve_board` raises `ValueError` with a clear message on zero
+- [x] `resolve_board` raises `ValueError` with a clear message on zero
       matches.
-- [ ] `resolve_board` raises `ValueError` listing the candidates on 2+
+- [x] `resolve_board` raises `ValueError` listing the candidates on 2+
       matches — it never silently returns the first one.
-- [ ] `console.py` has zero lines changed by this ticket.
+- [x] `console.py` has zero lines changed by this ticket.
 
 ## Testing
 
