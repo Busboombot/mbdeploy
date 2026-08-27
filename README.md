@@ -4,16 +4,17 @@ A standalone command-line tool for building and deploying micro:bit firmware to
 one or more devices via pyOCD.
 
 It identifies every connected micro:bit by its pyOCD **Unique ID**, joins that to
-the board's `/dev/cu.*` serial port (via `ioreg` on macOS) and its firmware
-`DEVICE:` announcement, and keeps a persistent registry at `config/devices.json`
-(relative to the project you run it in). `probe` records each board and assigns
-it a stable enumeration number (1..N); `list` and `probe` show every known board
-with a `CONN` column saying whether it is plugged in right now, while `deploy`
-targets a specific known device by enum number, name, serial path, or UID and
-refuses to flash a board recorded as the radio relay unless `--force-relay` is
-given. A `/dev/…` path is resolved against the **live** `ioreg` mapping — the
-board on that port right now — never against the registry's remembered `port`,
-which goes stale as macOS renames ports across reconnects.
+the board's live serial port (found with a `pyserial` VID:PID scan, on macOS or
+Linux alike) and its firmware `DEVICE:` announcement, and keeps a persistent
+registry at `config/devices.json` (relative to the project you run it in).
+`probe` records each board and assigns it a stable enumeration number (1..N);
+`list` and `probe` show every known board with a `CONN` column saying whether
+it is plugged in right now, while `deploy` targets a specific known device by
+enum number, name, serial path, or UID and refuses to flash a board recorded
+as the radio relay unless `--force-relay` is given. A `/dev/…` path is
+resolved against the **live** serial-port mapping — the board on that port
+right now — never against the registry's remembered `port`, which goes stale
+as the OS renames ports across reconnects.
 
 ## Addressing a board
 
@@ -63,6 +64,10 @@ Run `mbdeploy` from the root of the project whose firmware you're deploying so i
 finds `./build.py`, `./MICROBIT.hex`, and `./config/devices.json`. All project
 paths are CWD-relative, with `--config` / `--hex` / `--build-cmd` overrides.
 
+`mbdeploy` runs on Linux (including Raspberry Pi OS) as well as macOS — see
+"Linux / Raspberry Pi setup" in `mbdeploy --agent` for group-membership and
+udev details specific to headless boards.
+
 ## Subcommands
 
 | Subcommand | Description |
@@ -95,9 +100,10 @@ check the exit code.
 
 The reply goes to stdout and every status line to stderr, so
 `mbdeploy connect tovez STATUS` pipes cleanly. Boards are addressed the same way
-as with `deploy` — enum, name, or UID — plus a raw `/dev/cu.*` path, which is
-opened verbatim and so works even for a board that has never been probed.
-Connecting holds DTR low, so it does not reset the board.
+as with `deploy` — enum, name, or UID — plus a raw `/dev/...` path (e.g.
+`/dev/cu.usbmodem1234` on macOS, `/dev/ttyACM0` on Linux), which is opened
+verbatim and so works even for a board that has never been probed. Connecting
+holds DTR low, so it does not reset the board.
 
 ## Top-level flags
 

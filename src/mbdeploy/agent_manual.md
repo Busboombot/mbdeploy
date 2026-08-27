@@ -87,7 +87,7 @@ Each entry is keyed by the board's UID and carries:
 |---------------|---------|
 | `uid`         | Hardware unique id (40–52 hex chars). Stable forever. |
 | `enum`        | Small integer assigned once; never reused or changed. |
-| `port`        | `/dev/cu.*` serial port. Refreshed on every `probe`. |
+| `port`        | Serial port (`/dev/cu.*` on macOS, `/dev/ttyACM*` on Linux). Refreshed on every `probe`. |
 | `role`        | Device type from its `DEVICE:` announcement (e.g. `Nezha2`, `RADIOBRIDGE`). |
 | `common_name` | Human label for the board's role in a classroom ("Jane's robot"). Shown by `list`; **never** matched as a target. |
 | `device_name` | The board's own five-letter name, from its `DEVICE:` announcement. A target. |
@@ -138,28 +138,32 @@ resolved in this precedence order:
 
 1. **All digits** → matched against `enum`. Example: `2`
 2. **Contains `/`** (e.g. starts with `/dev/`) → matched against the **live**
-   `ioreg` port map: whichever board is on that path *right now* is the one
-   flashed. Example: `/dev/cu.usbmodem1234`
+   serial-port map (a `pyserial` VID:PID scan, on macOS or Linux alike):
+   whichever board is on that path *right now* is the one flashed. Example:
+   `/dev/cu.usbmodem1234` on macOS, `/dev/ttyACM0` on Linux.
 3. **40–52 hex chars** → matched against `uid`.
 4. **Anything else** → case-insensitive match on the board's own five-letter
    name: `device_name` (announced) then `board_name` (read from silicon).
    Example: `tovez`
 
 Step 2 is deliberately **not** a registry lookup. The registry's `port` is only
-as fresh as the last `probe`, and macOS re-issues `/dev/cu.usbmodem*` names on
-every reconnect, so two boards routinely swap paths. Matching the recorded port
-and then flashing that entry's UID would write firmware to a *different*,
-connected board than the path names. `deploy` therefore resolves the path
-live and refuses rather than guessing when it cannot:
+as fresh as the last `probe`, and the OS re-issues serial port names (e.g.
+`/dev/cu.usbmodem*` on macOS) on every reconnect, so two boards routinely swap
+paths. Matching the recorded port and then flashing that entry's UID would
+write firmware to a *different*, connected board than the path names. `deploy`
+therefore resolves the path live and refuses rather than guessing when it
+cannot:
 
 - The board on the path must already be in the registry — its entry is where
   `role` comes from, and `role` is what the relay guard reads. Run `probe` once
   for a board `deploy` has never seen.
 - If no micro:bit is on that path, `deploy` errors and lists the ports that are
   occupied.
-- If the live map is unavailable (it is read from macOS `ioreg`), `deploy`
-  errors rather than falling back to the recorded port. Target by enum, name,
-  or UID on other platforms.
+- If the live map comes back empty even though a probe is connected, `deploy`
+  errors rather than falling back to the recorded port — this can happen on
+  Linux if the current user lacks `plugdev`/`dialout` group membership (see
+  "Linux / Raspberry Pi setup" below). Target by enum, name, or UID to work
+  around it, or fix the group membership and retry.
 
 A board is addressed by its **own** name — the five-letter word (`tovez`,
 `gopiv`) its runtime derives from `FICR.DEVICEID[1]`, shown in the DEVICE NAME
@@ -184,6 +188,39 @@ devices, it errors and asks you to be explicit.
 
 For a name, enum, or UID, `connect` re-reads the port live rather than trusting
 the registry, for the same staleness reason.
+
+### 4.1 Linux / Raspberry Pi setup
+
+`mbdeploy` works identically on Linux — the live port map is a `pyserial`
+VID:PID scan, not an OS-specific tool, so nothing above is macOS-only. Facts
+below were verified on Nolanet, a 4-node Raspberry Pi 3B cluster (`magni`,
+`hodr`, `loki`, `meili`) running Debian Bookworm (aarch64) with Python 3.13.5
+and one micro:bit per node.
+
+- **Port naming.** A micro:bit enumerates as `/dev/ttyACM0` (not the macOS
+  `/dev/cu.usbmodem*` spelling). Use that form when targeting by path.
+- **Group membership.** The user running `mbdeploy` needs to be in two
+  groups: `plugdev` (raw USB access, needed by pyOCD) and `dialout` (the
+  serial port). Without both, the live port map comes back empty even
+  though a probe is connected, and `deploy` refuses a `/dev/...` target
+  (see §4 above) — the fix is `sudo usermod -aG plugdev,dialout <user>`
+  followed by a re-login.
+- **No new udev rule is needed.** Raspberry Pi OS already ships
+  `/lib/udev/rules.d/70-microbit.rules`, which matches
+  `SUBSYSTEM=="usb", ATTR{idVendor}=="0d28", TAG+="uaccess"`. Both
+  `/dev/ttyACM0` and the underlying USB device node come up
+  `root:plugdev 0660`, so `plugdev` membership alone is what grants
+  headless access — there is nothing to add. Do **not** write a
+  `MODE="0666"` rule for this vendor ID; it is unnecessary on Raspberry Pi
+  OS and was verified as such during this project's Linux support work.
+- **pyOCD runs headless, unprivileged.** With group membership in place,
+  `pyocd list` enumerates the probe and identifies the target as
+  nrf52833 / micro:bit V2 without root and without any additional pyOCD
+  configuration.
+- **Install footprint.** All 23 of mbdeploy's dependencies (`pyocd` 0.45.1,
+  `zeroconf`, `pyserial`, and their transitive requirements) resolve to
+  prebuilt aarch64 wheels on Raspberry Pi OS — no compilation step — and a
+  fresh virtualenv measures about 83 MB.
 
 ---
 
@@ -266,8 +303,9 @@ mbdeploy deploy gutov
 By port or UID:
 
 ```bash
-mbdeploy deploy /dev/cu.usbmodem1234
-mbdeploy deploy F1A2...  # full 40–52 hex UID
+mbdeploy deploy /dev/cu.usbmodem1234  # macOS
+mbdeploy deploy /dev/ttyACM0          # Linux
+mbdeploy deploy F1A2...               # full 40–52 hex UID
 ```
 
 ### 6.4 Clean build before deploying

@@ -3,18 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from importlib import resources
 from pathlib import Path
 
 from mbdeploy import __version__
-
-# Invoke pyocd through the running interpreter rather than as a bare PATH
-# lookup. mbdeploy is typically installed via pipx into an isolated venv, so
-# pyocd (a declared dependency) is importable here but its console script is
-# not on PATH. This mirrors the pattern already used in devices.py.
-_PYOCD = [sys.executable, "-m", "pyocd"]
 
 
 # ---------------------------------------------------------------------------
@@ -205,14 +198,15 @@ def _deploy_entry(target: str, registry: dict[str, dict]) -> dict:
 
     A ``/dev/...`` path is not, and is deliberately **not** looked up in the
     registry: a recorded ``port`` is only as fresh as the last ``probe``, and
-    macOS re-issues ``/dev/cu.usbmodem*`` names on every reconnect.  Matching
-    one would return the board that *used to* sit on that path, and ``deploy``
-    would then flash that board's UID — writing firmware to a different,
-    currently-connected board than the path names.  ``connect`` sidesteps this
-    by opening the path verbatim (see :func:`_connect_port`); ``deploy`` cannot,
-    because pyOCD addresses a board by UID, so the path is translated through
-    the *live* ``ioreg`` mapping instead: whichever board is on that port right
-    now is the one that gets flashed.
+    the OS re-issues serial port names (e.g. ``/dev/cu.usbmodem*`` on macOS)
+    on every reconnect.  Matching one would return the board that *used to*
+    sit on that path, and ``deploy`` would then flash that board's UID —
+    writing firmware to a different, currently-connected board than the path
+    names.  ``connect`` sidesteps this by opening the path verbatim (see
+    :func:`_connect_port`); ``deploy`` cannot, because pyOCD addresses a
+    board by UID, so the path is translated through the *live* serial-port
+    mapping instead (a ``pyserial`` VID:PID scan, on macOS or Linux alike):
+    whichever board is on that port right now is the one that gets flashed.
 
     That live UID must still be present in the registry.  The entry is where
     ``role`` comes from, and ``role`` is what the relay guard reads, so
@@ -226,8 +220,8 @@ def _deploy_entry(target: str, registry: dict[str, dict]) -> dict:
     if not (target.startswith("/dev/") or "/" in target):
         return devices_mod.resolve_target(target, registry)
 
-    # Restrict the ioreg scan to connected CMSIS-DAP probes so some other
-    # USB serial device can never be mistaken for a micro:bit.
+    # Restrict the live serial-port scan to connected CMSIS-DAP probes so
+    # some other USB serial device can never be mistaken for a micro:bit.
     known = {p["uid"] for p in devices_mod.flashable_probes()}
     live_ports = devices_mod.port_serial_map(known)
 
@@ -240,10 +234,11 @@ def _deploy_entry(target: str, registry: dict[str, dict]) -> dict:
                 f"cannot resolve port '{target}': no micro:bit is connected."
             )
         raise ValueError(
-            f"cannot resolve port '{target}': no live port mapping is "
-            "available (it is read from macOS 'ioreg'). Refusing to fall back "
-            "to the registry's recorded port, which may name a different "
-            "board. Target by enum, name, or UID instead."
+            f"cannot resolve port '{target}': no micro:bit serial port was "
+            "found, even though a probe is connected. On Linux, check that "
+            "this user is in the 'plugdev'/'dialout' group. Refusing to fall "
+            "back to the registry's recorded port, which may name a "
+            "different board. Target by enum, name, or UID instead."
         )
 
     uid_by_port = {port: uid for uid, port in live_ports.items()}
@@ -333,48 +328,9 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             return rc
 
     # --- flash (with mass-erase recovery for locked parts) ---
-    flash_cmd = [
-        *_PYOCD, "flash",
-        "-t", target_mcu,
-        "--uid", uid,
-        hex_path,
-    ]
-    rc = subprocess.run(flash_cmd).returncode
-    if rc != 0:
-        # A locked/protected nRF (APPROTECT set, or a protected SoftDevice
-        # region at 0x0) rejects every flash-algorithm erase, so the flash
-        # fails before it can program. Neither sector nor chip erase clears
-        # that — only a CTRL-AP mass erase (ERASEALL), which also resets
-        # APPROTECT. Recover by mass-erasing, then retry the flash once.
-        print(
-            "flash failed — attempting CTRL-AP mass erase to recover a "
-            "locked device, then retrying.",
-            file=sys.stderr,
-        )
-        erase_cmd = [
-            *_PYOCD, "erase",
-            "-t", target_mcu,
-            "--uid", uid,
-            "--mass",
-        ]
-        erase_rc = subprocess.run(erase_cmd).returncode
-        if erase_rc != 0:
-            print(f"Error: mass erase failed (exit {erase_rc}).", file=sys.stderr)
-            return erase_rc
-        rc = subprocess.run(flash_cmd).returncode
-        if rc != 0:
-            print(
-                f"Error: flash still failed after mass erase (exit {rc}).",
-                file=sys.stderr,
-            )
-            return rc
+    from mbdeploy import flash as flash_mod
 
-    reset_cmd = [
-        *_PYOCD, "reset",
-        "-t", target_mcu,
-        "--uid", uid,
-    ]
-    return subprocess.run(reset_cmd).returncode
+    return flash_mod.flash_hex(uid, hex_path, target_mcu)
 
 
 def _connect_port(target: str, registry: dict[str, dict]) -> str:
