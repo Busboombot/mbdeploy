@@ -1,7 +1,7 @@
 ---
 id: 008
 title: Install mbdeploy + systemd system unit on all four Nolanet nodes
-status: in-progress
+status: done
 use-cases:
 - SUC-014
 depends-on:
