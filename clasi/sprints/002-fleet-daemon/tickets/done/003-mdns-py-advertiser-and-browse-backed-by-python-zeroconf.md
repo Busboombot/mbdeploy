@@ -1,7 +1,7 @@
 ---
 id: '003'
 title: 'mdns.py: Advertiser and browse backed by python-zeroconf'
-status: in-progress
+status: done
 use-cases:
 - SUC-003
 depends-on: []
