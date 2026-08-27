@@ -240,10 +240,11 @@ def _deploy_entry(target: str, registry: dict[str, dict]) -> dict:
                 f"cannot resolve port '{target}': no micro:bit is connected."
             )
         raise ValueError(
-            f"cannot resolve port '{target}': no live port mapping is "
-            "available (it is read from macOS 'ioreg'). Refusing to fall back "
-            "to the registry's recorded port, which may name a different "
-            "board. Target by enum, name, or UID instead."
+            f"cannot resolve port '{target}': no micro:bit serial port was "
+            "found, even though a probe is connected. On Linux, check that "
+            "this user is in the 'plugdev'/'dialout' group. Refusing to fall "
+            "back to the registry's recorded port, which may name a "
+            "different board. Target by enum, name, or UID instead."
         )
 
     uid_by_port = {port: uid for uid, port in live_ports.items()}

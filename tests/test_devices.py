@@ -11,6 +11,7 @@ import json
 import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -98,6 +99,97 @@ class TestIsRelay:
 
     def test_empty_string_is_not_relay(self):
         assert is_relay("") is False
+
+
+# ---------------------------------------------------------------------------
+# port_serial_map — direct tests against fake comports() results
+#
+# No existing reference to port_serial_map in this file exercises it
+# directly; every one of the ~10 references monkeypatches it away. These are
+# the first-ever direct tests, against fake port objects (no real hardware,
+# no real pyserial internals) exposing exactly the four attributes the
+# implementation reads.
+# ---------------------------------------------------------------------------
+
+_DAPLINK_VID = 0x0D28
+_DAPLINK_PID = 0x0204
+
+
+def _fake_port(device, vid, pid, serial_number):
+    """Stand-in for a ``serial.tools.list_ports_common.ListPortInfo``."""
+    return SimpleNamespace(device=device, vid=vid, pid=pid, serial_number=serial_number)
+
+
+class TestPortSerialMap:
+    def _patch_comports(self, monkeypatch, ports):
+        monkeypatch.setattr(
+            devices_mod.serial.tools.list_ports, "comports", lambda: ports
+        )
+
+    def test_uid_to_port_mapping(self, monkeypatch):
+        ports = [
+            _fake_port("/dev/cu.usbmodem1", _DAPLINK_VID, _DAPLINK_PID, "uid-aaa"),
+            _fake_port("/dev/cu.usbmodem2", _DAPLINK_VID, _DAPLINK_PID, "uid-bbb"),
+        ]
+        self._patch_comports(monkeypatch, ports)
+
+        assert devices_mod.port_serial_map() == {
+            "uid-aaa": "/dev/cu.usbmodem1",
+            "uid-bbb": "/dev/cu.usbmodem2",
+        }
+
+    def test_known_filters_to_listed_uids(self, monkeypatch):
+        ports = [
+            _fake_port("/dev/cu.usbmodem1", _DAPLINK_VID, _DAPLINK_PID, "uid-aaa"),
+            _fake_port("/dev/cu.usbmodem2", _DAPLINK_VID, _DAPLINK_PID, "uid-bbb"),
+        ]
+        self._patch_comports(monkeypatch, ports)
+
+        assert devices_mod.port_serial_map(known={"uid-aaa"}) == {
+            "uid-aaa": "/dev/cu.usbmodem1",
+        }
+
+    def test_known_none_returns_every_microbit_port(self, monkeypatch):
+        ports = [
+            _fake_port("/dev/cu.usbmodem1", _DAPLINK_VID, _DAPLINK_PID, "uid-aaa"),
+            _fake_port("/dev/cu.usbmodem2", _DAPLINK_VID, _DAPLINK_PID, "uid-bbb"),
+        ]
+        self._patch_comports(monkeypatch, ports)
+
+        assert devices_mod.port_serial_map(known=None) == {
+            "uid-aaa": "/dev/cu.usbmodem1",
+            "uid-bbb": "/dev/cu.usbmodem2",
+        }
+
+    def test_non_microbit_vid_pid_is_excluded_even_on_serial_collision(self, monkeypatch):
+        # Same serial number a real UID might use, wrong VID:PID -- must
+        # never be mistaken for a micro:bit even if `known` would admit it.
+        ports = [_fake_port("/dev/cu.usbserial", 0x0403, 0x6001, "uid-aaa")]
+        self._patch_comports(monkeypatch, ports)
+
+        assert devices_mod.port_serial_map(known={"uid-aaa"}) == {}
+
+    def test_serial_number_none_is_skipped_without_raising(self, monkeypatch):
+        # Three ports like this exist on the dev Mac (Bluetooth-Incoming-Port,
+        # debug-console, wlan-debug). A naive dict build maps None as a key.
+        ports = [
+            _fake_port("/dev/cu.Bluetooth-Incoming-Port", _DAPLINK_VID, _DAPLINK_PID, None),
+            _fake_port("/dev/cu.usbmodem1", _DAPLINK_VID, _DAPLINK_PID, "uid-aaa"),
+        ]
+        self._patch_comports(monkeypatch, ports)
+
+        assert devices_mod.port_serial_map() == {"uid-aaa": "/dev/cu.usbmodem1"}
+
+    def test_empty_comports_yields_empty_dict(self, monkeypatch):
+        self._patch_comports(monkeypatch, [])
+
+        assert devices_mod.port_serial_map() == {}
+
+    def test_no_matching_ports_yields_empty_dict(self, monkeypatch):
+        ports = [_fake_port("/dev/cu.usbserial", 0x0403, 0x6001, "some-serial")]
+        self._patch_comports(monkeypatch, ports)
+
+        assert devices_mod.port_serial_map() == {}
 
 
 # ---------------------------------------------------------------------------
@@ -692,7 +784,9 @@ class TestDeployPortTarget:
         rc = _cmd_deploy(args)
 
         assert rc != 0
-        assert "ioreg" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "no micro:bit serial port was found" in err
+        assert "plugdev" in err and "dialout" in err
         assert calls == []
 
     def test_no_boards_connected_at_all(self, monkeypatch, tmp_path, capsys):

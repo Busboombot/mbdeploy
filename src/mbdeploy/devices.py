@@ -24,6 +24,7 @@ from pathlib import Path
 
 try:  # pyserial is optional — absent in CI without hardware
     import serial  # type: ignore
+    import serial.tools.list_ports  # type: ignore
 except Exception:  # pragma: no cover
     serial = None  # type: ignore
 
@@ -35,8 +36,9 @@ DEFAULT_MCU = "nrf52833"
 #: into the board's five-letter friendly name.
 FICR_DEVICEID1 = 0x10000064
 
-_IOREG_SERIAL_RE = re.compile(r'"USB Serial Number"\s*=\s*"([^"]+)"')
-_IOREG_CALLOUT_RE = re.compile(r'"IOCalloutDevice"\s*=\s*"([^"]+)"')
+#: ARM DAPLink's USB VID:PID — every micro:bit's onboard debug/CDC interface
+#: enumerates as this pair, on both macOS and Linux.
+_DAPLINK_VID_PID = (0x0D28, 0x0204)
 
 #: CODAL's friendly-name codebook: five base-5 digits, alternating
 #: consonants and vowels, most-significant digit first in the printed name.
@@ -91,34 +93,31 @@ def _flashable_probes_cli() -> list[dict[str, str]]:
 
 
 def port_serial_map(known: set[str] | None = None) -> dict[str, str]:
-    """Map USB serial (== pyOCD UID) -> /dev/cu.* port via ``ioreg`` (macOS only).
+    """Map USB serial (== pyOCD UID) -> serial port via ``pyserial``.
+
+    Uses ``serial.tools.list_ports.comports()``, filtered to VID:PID
+    ``0x0D28:0x0204`` (ARM DAPLink, the onboard debug/CDC interface every
+    micro:bit enumerates as). ``comports()`` returns the pyOCD UID verbatim
+    as ``serial_number`` on both macOS and Linux, so one implementation
+    covers both platforms.
 
     When ``known`` is given, only those UIDs are recorded so a non-micro:bit
-    serial port can never be mis-attributed.  Returns ``{}`` off macOS or if
-    ``ioreg`` is unavailable.
+    serial port can never be mis-attributed. Returns ``{}`` if pyserial is
+    unavailable or no micro:bit port is found.
     """
-    try:
-        proc = subprocess.run(
-            ["ioreg", "-r", "-c", "IOUSBHostDevice", "-l"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return {}
-    if proc.returncode != 0:
+    if serial is None:
         return {}
 
     out: dict[str, str] = {}
-    current_serial: str | None = None
-    for line in proc.stdout.splitlines():
-        sm = _IOREG_SERIAL_RE.search(line)
-        if sm:
-            current_serial = sm.group(1)
+    for port in serial.tools.list_ports.comports():
+        if (port.vid, port.pid) != _DAPLINK_VID_PID:
             continue
-        cm = _IOREG_CALLOUT_RE.search(line)
-        if cm and current_serial:
-            if known is not None and current_serial not in known:
-                continue
-            out.setdefault(current_serial, cm.group(1))
+        uid = port.serial_number
+        if uid is None:
+            continue
+        if known is not None and uid not in known:
+            continue
+        out.setdefault(uid, port.device)
     return out
 
 
