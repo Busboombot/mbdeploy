@@ -769,6 +769,7 @@ class Supervisor:
         target_mcu: str = devices.DEFAULT_MCU,
         token: str | None = None,
         no_flash: bool = False,
+        service_name: str | None = None,
     ) -> None:
         self.accept_loop = accept_loop
         self.advertiser = advertiser
@@ -778,6 +779,13 @@ class Supervisor:
         self.target_mcu = target_mcu
         self.token = token
         self.no_flash = no_flash
+        #: ticket 007's `--service-name`: when set, overrides the
+        #: board_name/device_name/mb-<uid8> fallback chain entirely for
+        #: *every* board this Supervisor manages. Only meaningful on a
+        #: single-board host (Nolanet's case, sprint.md Step 7 Open
+        #: Question) -- on a multi-board host every board would get the
+        #: same name and rely on zeroconf's own collision-renaming.
+        self.service_name = service_name
 
         #: uid -> live Board, for every currently-connected board.
         self.boards: dict[str, Board] = {}
@@ -834,7 +842,7 @@ class Supervisor:
             self.config_path, target_mcu=self.target_mcu, only_uids={uid}
         )
         entry = next((e for e in entries if e.get("uid") == uid), {"uid": uid})
-        name = _instance_name(entry, uid)
+        name = self.service_name or _instance_name(entry, uid)
 
         serial_port, flash_port = self._alloc_ports()
         serial_listener = self._bind_listener(serial_port)

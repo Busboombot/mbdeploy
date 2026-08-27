@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
+import threading
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 from mbdeploy import __version__
 
@@ -22,6 +25,16 @@ _DEFAULT_MCU = "nrf52833"
 # import the device layer (and pyserial) on every invocation.
 _DEFAULT_BAUD = 115200
 _DEFAULT_CONNECT_TIMEOUT = 2.0
+
+# Mirrors server.DEFAULT_POLL_INTERVAL, kept here for the same reason: building
+# the parser (and printing --help) shouldn't have to import mbdeploy.server
+# (and transitively pyocd/zeroconf) at all.
+_DEFAULT_POLL_INTERVAL = 2.0
+
+#: How long `serve`'s shutdown waits for the accept-loop/Supervisor threads
+#: to actually exit before giving up on them anyway -- shutdown must never
+#: hang past this on a thread that refuses to die.
+_SERVE_JOIN_TIMEOUT = 5.0
 
 _AGENT_MANUAL = "agent_manual.md"
 
@@ -408,6 +421,218 @@ def _cmd_connect(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# serve
+# ---------------------------------------------------------------------------
+
+def _resolve_serve_token(args: argparse.Namespace) -> str | None:
+    """Resolve `--token`/`--token-file` to a single secret string, or
+    `None` if neither was given.
+
+    `--token` is used verbatim. `--token-file` reads the file and strips
+    trailing whitespace/newline before using the result; argparse's
+    mutually-exclusive group guarantees at most one of `args.token`/
+    `args.token_file` is set, so there is nothing to reconcile here.
+    Neither given -> `None`, matching today's fully-open default: no
+    `AUTH` is required by `serve_serial`/`serve_flash`.
+
+    Raises `ValueError` (never touches stdout/stderr itself) on a
+    missing `--token-file` or one that is empty after stripping -- the
+    caller is responsible for turning that into a clean, non-zero-exit
+    startup error rather than a silent "no auth."
+    """
+    if args.token is not None:
+        return args.token
+    if args.token_file is not None:
+        try:
+            text = Path(args.token_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(
+                f"cannot read --token-file '{args.token_file}': {exc}"
+            ) from exc
+        token = text.rstrip()
+        if not token:
+            raise ValueError(f"--token-file '{args.token_file}' is empty")
+        return token
+    return None
+
+
+def _build_serve_runtime(
+    args: argparse.Namespace, config_path: Path, token: str | None
+) -> tuple[Any, Any, Any]:
+    """Construct `(advertiser, accept_loop, supervisor)` from parsed
+    `serve` args.
+
+    Pure construction only -- no thread is started and no signal handler
+    is installed here -- so a test can inspect exactly what each
+    component was built with (e.g. `--bind` reaching both the
+    `Advertiser` constructor and `Supervisor.bind`) without ever running
+    the blocking serve loop below.
+    """
+    from mbdeploy import mdns as mdns_mod
+    from mbdeploy import server as server_mod
+
+    advertiser = mdns_mod.Advertiser(bind_addr=args.bind or None)
+    accept_loop = server_mod.AcceptLoop()
+    supervisor = server_mod.Supervisor(
+        accept_loop=accept_loop,
+        advertiser=advertiser,
+        config_path=config_path,
+        base_port=args.base_port,
+        bind=args.bind or "",
+        target_mcu=args.target_mcu,
+        token=token,
+        no_flash=args.no_flash,
+        service_name=args.service_name,
+    )
+    return advertiser, accept_loop, supervisor
+
+
+class _ServeShutdown:
+    """Signal handler (and manually-callable equivalent) for `serve`.
+
+    Unregisters every mDNS advertisement and closes every listener
+    socket, then signals the run loop to stop -- exactly once, no matter
+    how many times it is invoked. SIGINT and SIGTERM both wire to the
+    *same* instance, and systemd may deliver more than one signal during
+    a slow shutdown, so a second (or concurrent) invocation must be a
+    silent no-op, never a re-entrant close or a traceback on an
+    already-closed socket -- that idempotency is the whole reason this
+    is a class with a guarded `_done` flag rather than a plain function.
+
+    Before touching the `Advertiser` or any listener socket, this joins
+    `supervisor_thread` (bounded by `join_timeout`) if one was given.
+    `stop_event` only prevents the Supervisor's poll loop from starting
+    *another* tick -- it does not interrupt a tick already in flight, and
+    a tick can be in the middle of `Advertiser.register()` (a board
+    arriving) when a signal lands. Closing the `Advertiser` out from
+    under that in-flight call, observed against a real `zeroconf`
+    backend, corrupts its internal event loop instead of cleanly
+    unregistering (``RuntimeError: Event loop is closed``) -- joining
+    first lets that tick finish before anything is torn down.
+    """
+
+    def __init__(
+        self,
+        supervisor: Any,
+        accept_loop: Any,
+        advertiser: Any,
+        stop_event: threading.Event,
+        *,
+        supervisor_thread: threading.Thread | None = None,
+        join_timeout: float = _SERVE_JOIN_TIMEOUT,
+    ) -> None:
+        self._supervisor = supervisor
+        self._accept_loop = accept_loop
+        self._advertiser = advertiser
+        self._stop_event = stop_event
+        self._supervisor_thread = supervisor_thread
+        self._join_timeout = join_timeout
+        self._lock = threading.Lock()
+        self._done = False
+
+    def __call__(self, signum: int | None = None, frame: Any = None) -> None:
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+
+        self._stop_event.set()
+
+        thread = self._supervisor_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self._join_timeout)
+            if thread.is_alive():
+                print(
+                    "mbdeploy serve: Supervisor thread did not exit within "
+                    f"{self._join_timeout:g}s of shutdown; unregistering "
+                    "anyway.",
+                    file=sys.stderr,
+                )
+
+        for board in list(self._supervisor.boards.values()):
+            for sock in (board.serial_listener, board.flash_listener):
+                if sock is None:
+                    continue
+                try:
+                    self._accept_loop.unregister(sock)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        self._advertiser.close()
+        self._accept_loop.close()
+
+
+def _run_serve(
+    supervisor: Any,
+    accept_loop: Any,
+    advertiser: Any,
+    poll_interval: float,
+) -> int:
+    """Run `serve`'s accept loop and USB watcher until SIGINT/SIGTERM,
+    then return 0.
+
+    Foreground only -- no self-daemonizing, no pidfile; systemd captures
+    stdout into the journal. SIGINT and SIGTERM both wire to the same
+    `_ServeShutdown` instance (installed here, before the accept loop and
+    the Supervisor's poll loop start on their own threads), so either
+    signal unregisters every mDNS advertisement and closes every
+    listener socket before this returns.
+    """
+    stop_event = threading.Event()
+
+    # Built (but not started) before `_ServeShutdown` so its shutdown
+    # handler can join `supervisor_thread` before touching the Advertiser
+    # or any listener socket -- see `_ServeShutdown`'s docstring for why
+    # that ordering matters.
+    accept_thread = threading.Thread(
+        target=accept_loop.run, name="mbdeploy-accept", daemon=True
+    )
+    supervisor_thread = threading.Thread(
+        target=supervisor.run,
+        kwargs={"poll_interval": poll_interval, "stop": stop_event},
+        name="mbdeploy-supervisor",
+        daemon=True,
+    )
+
+    shutdown = _ServeShutdown(
+        supervisor, accept_loop, advertiser, stop_event,
+        supervisor_thread=supervisor_thread,
+    )
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    accept_thread.start()
+    supervisor_thread.start()
+
+    print(
+        f"mbdeploy serve: running (poll every {poll_interval:g}s; "
+        "Ctrl-C or SIGTERM to stop)",
+        flush=True,
+    )
+    stop_event.wait()
+    shutdown()  # idempotent -- a no-op if a signal already ran it
+
+    accept_thread.join(timeout=_SERVE_JOIN_TIMEOUT)
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        token = _resolve_serve_token(args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
+    advertiser, accept_loop, supervisor = _build_serve_runtime(args, config_path, token)
+    return _run_serve(supervisor, accept_loop, advertiser, args.poll_interval)
+
+
+# ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
 
@@ -585,6 +810,77 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config", metavar="PATH", help="Path to device config file."
     )
     connect_p.set_defaults(func=_cmd_connect)
+
+    # --- serve ---
+    serve_p = subparsers.add_parser(
+        "serve",
+        help="Run the fleet daemon: watch USB and advertise each board's "
+             "serial/flash services over mDNS.",
+    )
+    serve_p.add_argument("--config", metavar="PATH", help="Path to device config file.")
+    serve_p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=_DEFAULT_POLL_INTERVAL,
+        dest="poll_interval",
+        metavar="SEC",
+        help=f"Seconds between USB polls (default: {_DEFAULT_POLL_INTERVAL:g}).",
+    )
+    serve_p.add_argument(
+        "--base-port",
+        type=int,
+        default=0,
+        dest="base_port",
+        metavar="N",
+        help="First of a sequential port pair handed to each board "
+             "(default: 0, meaning OS-assigned ephemeral ports).",
+    )
+    serve_p.add_argument(
+        "--bind",
+        default="",
+        metavar="ADDR",
+        help="Address to bind listener sockets and advertise via mDNS "
+             "(default: all interfaces).",
+    )
+    token_group = serve_p.add_mutually_exclusive_group()
+    token_group.add_argument(
+        "--token",
+        metavar="SECRET",
+        help="Shared secret clients must send via 'AUTH <token>' before "
+             "either service does anything else. Mutually exclusive with "
+             "--token-file.",
+    )
+    token_group.add_argument(
+        "--token-file",
+        metavar="PATH",
+        dest="token_file",
+        help="Read the shared secret from PATH instead of the command line, "
+             "so it never appears in 'systemctl cat's ExecStart output. "
+             "Mutually exclusive with --token.",
+    )
+    serve_p.add_argument(
+        "--no-flash",
+        action="store_true",
+        dest="no_flash",
+        help="Reject every FLASH request with 'ERR flash disabled', "
+             "without ever touching flash_hex.",
+    )
+    serve_p.add_argument(
+        "--target-mcu",
+        metavar="MCU",
+        dest="target_mcu",
+        default=_DEFAULT_MCU,
+        help=f"Target MCU type (default: {_DEFAULT_MCU}).",
+    )
+    serve_p.add_argument(
+        "--service-name",
+        metavar="NAME",
+        dest="service_name",
+        help="Override the mDNS instance name for every board this process "
+             "manages, bypassing the board_name/device_name/mb-<uid8> "
+             "fallback chain. Only meaningful on a single-board host.",
+    )
+    serve_p.set_defaults(func=_cmd_serve)
 
     return parser
 

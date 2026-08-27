@@ -1029,6 +1029,20 @@ class TestSupervisorTick:
         assert names == {expected}
         assert sup.boards[_UID_A].name == expected
 
+    def test_service_name_overrides_the_fallback_chain(self, make_supervisor):
+        """Ticket 007's `--service-name`: when set on the Supervisor, it
+        wins over `board_name`/`device_name`/`mb-<uid8>` entirely, for
+        every board -- a single-board-host override, not a per-board
+        name (sprint.md Step 7 Open Question)."""
+        sup, adv, calls = make_supervisor(
+            {_UID_A: {"uid": _UID_A, "board_name": "tovez"}},
+            service_name="nolanet-1",
+        )
+        sup._tick([{"uid": _UID_A}])
+        names = {c[0] for c in adv.register_calls}
+        assert names == {"nolanet-1"}
+        assert sup.boards[_UID_A].name == "nolanet-1"
+
     def test_port_allocation_sequential_then_reclaimed_on_departure(self, make_supervisor):
         sup, adv, calls = make_supervisor(
             {
