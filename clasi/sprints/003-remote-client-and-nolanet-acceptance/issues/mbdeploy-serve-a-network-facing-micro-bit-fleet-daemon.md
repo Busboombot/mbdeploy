@@ -1,6 +1,6 @@
 ---
 status: in-progress
-sprint: '002'
+sprint: '003'
 tickets:
 - 001-001
 - 001-002
@@ -14,6 +14,15 @@ tickets:
 - 002-006
 - 002-007
 - 002-008
+- 003-001
+- 003-002
+- 003-003
+- 003-004
+- 003-005
+- 003-006
+- 003-007
+- 003-008
+- 003-009
 ---
 
 # `mbdeploy serve` — a network-facing micro:bit fleet daemon
