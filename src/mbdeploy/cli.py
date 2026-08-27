@@ -3,18 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from importlib import resources
 from pathlib import Path
 
 from mbdeploy import __version__
-
-# Invoke pyocd through the running interpreter rather than as a bare PATH
-# lookup. mbdeploy is typically installed via pipx into an isolated venv, so
-# pyocd (a declared dependency) is importable here but its console script is
-# not on PATH. This mirrors the pattern already used in devices.py.
-_PYOCD = [sys.executable, "-m", "pyocd"]
 
 
 # ---------------------------------------------------------------------------
@@ -334,48 +327,9 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             return rc
 
     # --- flash (with mass-erase recovery for locked parts) ---
-    flash_cmd = [
-        *_PYOCD, "flash",
-        "-t", target_mcu,
-        "--uid", uid,
-        hex_path,
-    ]
-    rc = subprocess.run(flash_cmd).returncode
-    if rc != 0:
-        # A locked/protected nRF (APPROTECT set, or a protected SoftDevice
-        # region at 0x0) rejects every flash-algorithm erase, so the flash
-        # fails before it can program. Neither sector nor chip erase clears
-        # that — only a CTRL-AP mass erase (ERASEALL), which also resets
-        # APPROTECT. Recover by mass-erasing, then retry the flash once.
-        print(
-            "flash failed — attempting CTRL-AP mass erase to recover a "
-            "locked device, then retrying.",
-            file=sys.stderr,
-        )
-        erase_cmd = [
-            *_PYOCD, "erase",
-            "-t", target_mcu,
-            "--uid", uid,
-            "--mass",
-        ]
-        erase_rc = subprocess.run(erase_cmd).returncode
-        if erase_rc != 0:
-            print(f"Error: mass erase failed (exit {erase_rc}).", file=sys.stderr)
-            return erase_rc
-        rc = subprocess.run(flash_cmd).returncode
-        if rc != 0:
-            print(
-                f"Error: flash still failed after mass erase (exit {rc}).",
-                file=sys.stderr,
-            )
-            return rc
+    from mbdeploy import flash as flash_mod
 
-    reset_cmd = [
-        *_PYOCD, "reset",
-        "-t", target_mcu,
-        "--uid", uid,
-    ]
-    return subprocess.run(reset_cmd).returncode
+    return flash_mod.flash_hex(uid, hex_path, target_mcu)
 
 
 def _connect_port(target: str, registry: dict[str, dict]) -> str:
