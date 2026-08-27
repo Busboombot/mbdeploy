@@ -1,7 +1,7 @@
 ---
 id: '003'
 title: 'Regression tests for both DEVICE: announcement dialects'
-status: in-progress
+status: done
 use-cases:
 - UC-001
 depends-on: []
