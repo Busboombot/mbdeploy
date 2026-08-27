@@ -1,7 +1,7 @@
 ---
 id: '001'
 title: 'Hardware risk spike: verify hidapi-exit crash risk on Nolanet (Linux)'
-status: in-progress
+status: done
 use-cases:
 - SUC-015
 depends-on: []
