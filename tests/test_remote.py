@@ -1,4 +1,5 @@
-"""Tests for mbdeploy.remote: the SocketSerial adapter and resolve_board().
+"""Tests for mbdeploy.remote: the SocketSerial adapter, resolve_board(),
+and list_remote() -- plus `list --remote`'s wiring into `cli.py`.
 
 ``SocketSerial`` is exercised two ways:
 
@@ -13,12 +14,14 @@
   -driven path) completely unchanged -- proving the adapter satisfies
   ``console.py``'s duck-typed contract for real, not just in isolation.
 
-``resolve_board()`` is exercised against a fake ``mdns.browse()`` --
-no real zeroconf traffic.
+``resolve_board()`` and ``list_remote()`` are both exercised against a
+fake ``mdns.browse()`` -- no real zeroconf traffic. `cli.py`'s `_cmd_list`
+`--remote` branch is exercised against a fake ``remote.list_remote()``.
 """
 
 from __future__ import annotations
 
+import argparse
 import io
 import re
 import socket
@@ -27,11 +30,13 @@ import time
 
 import pytest
 
+import mbdeploy.cli as cli_mod
 import mbdeploy.console as console_mod
 import mbdeploy.remote as remote_mod
 from mbdeploy.remote import SocketSerial, resolve_board
 
 SERVICE_TYPE = "_mbserial._tcp.local."
+FLASH_SERVICE_TYPE = "_mbflash._tcp.local."
 
 
 def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> bool:
@@ -395,9 +400,11 @@ class TestConsoleUnchangedAgainstSocketSerial:
 # ---------------------------------------------------------------------------
 
 
-def _browse_entry(short_name: str, host: str, port: int, txt=None) -> dict:
+def _browse_entry(
+    short_name: str, host: str, port: int, txt=None, service_type: str = SERVICE_TYPE
+) -> dict:
     return {
-        "name": f"{short_name}.{SERVICE_TYPE}",
+        "name": f"{short_name}.{service_type}",
         "host": host,
         "port": port,
         "txt": txt
@@ -491,3 +498,265 @@ class TestResolveBoard:
         resolve_board("togov", SERVICE_TYPE, timeout=5.0)
 
         assert calls == [(SERVICE_TYPE, 5.0)]
+
+
+# ---------------------------------------------------------------------------
+# list_remote()
+# ---------------------------------------------------------------------------
+
+
+def _browse_by_type(**by_type):
+    """Build a fake ``mdns.browse`` returning ``by_type[service_type]``."""
+
+    def fake_browse(service_type, timeout):
+        return by_type.get(service_type, [])
+
+    return fake_browse
+
+
+class TestListRemote:
+    def test_joins_both_service_types_into_one_row_per_board(self, monkeypatch):
+        """A board advertising on both service types must be one row, not two."""
+        uid = "u-1"
+        txt_common = {
+            "uid": uid, "role": "", "common_name": "Bot A", "enum": "3",
+        }
+        serial = [_browse_entry(
+            "togov", "192.168.1.10", 9001,
+            txt={**txt_common, "port": "9001"},
+        )]
+        flash = [_browse_entry(
+            "togov", "192.168.1.10", 9101,
+            txt={**txt_common, "port": "9101"},
+            service_type=FLASH_SERVICE_TYPE,
+        )]
+        monkeypatch.setattr(
+            remote_mod.mdns, "browse",
+            _browse_by_type(**{SERVICE_TYPE: serial, FLASH_SERVICE_TYPE: flash}),
+        )
+
+        rows = remote_mod.list_remote()
+
+        assert rows == [{
+            "enum": "3",
+            "name": "togov",
+            "common": "Bot A",
+            "role": "",
+            "uid": uid,
+            "host": "192.168.1.10",
+        }]
+
+    def test_board_on_only_one_service_type_still_gets_exactly_one_row(self, monkeypatch):
+        """serve's flash listener hasn't come up yet (or the daemon only
+        exposes one service) -- still exactly one row, not zero."""
+        uid = "solo-1"
+        serial = [_browse_entry(
+            "solob", "192.168.1.20", 9002,
+            txt={"uid": uid, "role": "relay", "common_name": "", "enum": "1", "port": "9002"},
+        )]
+        monkeypatch.setattr(
+            remote_mod.mdns, "browse", _browse_by_type(**{SERVICE_TYPE: serial}),
+        )
+
+        rows = remote_mod.list_remote()
+
+        assert rows == [{
+            "enum": "1",
+            "name": "solob",
+            "common": "",
+            "role": "relay",
+            "uid": uid,
+            "host": "192.168.1.20",
+        }]
+
+    def test_four_boards_across_four_hosts_each_get_their_own_row(self, monkeypatch):
+        """The real-world Nolanet shape: 4 nodes, 4 boards, 4 distinct hosts."""
+        boards = [
+            ("magni-board", "192.168.1.101", "u-magni"),
+            ("hodr-board", "192.168.1.102", "u-hodr"),
+            ("loki-board", "192.168.1.103", "u-loki"),
+            ("meili-board", "192.168.1.104", "u-meili"),
+        ]
+        serial, flash = [], []
+        for name, host, uid in boards:
+            txt = {"uid": uid, "role": "", "common_name": "", "enum": "0"}
+            serial.append(_browse_entry(name, host, 9001, txt={**txt, "port": "9001"}))
+            flash.append(_browse_entry(
+                name, host, 9101, txt={**txt, "port": "9101"},
+                service_type=FLASH_SERVICE_TYPE,
+            ))
+        monkeypatch.setattr(
+            remote_mod.mdns, "browse",
+            _browse_by_type(**{SERVICE_TYPE: serial, FLASH_SERVICE_TYPE: flash}),
+        )
+
+        rows = remote_mod.list_remote()
+
+        assert len(rows) == 4
+        assert {row["host"] for row in rows} == {b[1] for b in boards}
+        assert {row["name"] for row in rows} == {b[0] for b in boards}
+        assert {row["uid"] for row in rows} == {b[2] for b in boards}
+
+    def test_empty_browse_on_both_service_types_returns_empty_list(self, monkeypatch):
+        monkeypatch.setattr(remote_mod.mdns, "browse", lambda *a, **k: [])
+
+        assert remote_mod.list_remote() == []
+
+    def test_missing_txt_fields_produce_blank_strings_not_a_crash(self, monkeypatch):
+        entry = _browse_entry("bareb", "192.168.1.55", 9003, txt={})
+        monkeypatch.setattr(
+            remote_mod.mdns, "browse", _browse_by_type(**{SERVICE_TYPE: [entry]}),
+        )
+
+        rows = remote_mod.list_remote()
+
+        assert rows == [{
+            "enum": "", "name": "bareb", "common": "", "role": "", "uid": "",
+            "host": "192.168.1.55",
+        }]
+
+    def test_uid_missing_falls_back_to_grouping_by_short_name(self, monkeypatch):
+        """No TXT uid at all on either registration: still one row, not two,
+        keyed by the recovered short name instead."""
+        serial = [_browse_entry("nouid", "192.168.1.66", 9004, txt={})]
+        flash = [_browse_entry(
+            "nouid", "192.168.1.66", 9104, txt={}, service_type=FLASH_SERVICE_TYPE,
+        )]
+        monkeypatch.setattr(
+            remote_mod.mdns, "browse",
+            _browse_by_type(**{SERVICE_TYPE: serial, FLASH_SERVICE_TYPE: flash}),
+        )
+
+        rows = remote_mod.list_remote()
+
+        assert len(rows) == 1
+        assert rows[0]["name"] == "nouid"
+
+    def test_browse_called_for_both_service_types_with_the_given_timeout(self, monkeypatch):
+        calls = []
+
+        def fake_browse(service_type, timeout):
+            calls.append((service_type, timeout))
+            return []
+
+        monkeypatch.setattr(remote_mod.mdns, "browse", fake_browse)
+
+        remote_mod.list_remote(timeout=5.0)
+
+        assert calls == [(SERVICE_TYPE, 5.0), (FLASH_SERVICE_TYPE, 5.0)]
+
+
+# ---------------------------------------------------------------------------
+# `list --remote` wiring: cli._cmd_list's remote branch
+# ---------------------------------------------------------------------------
+
+
+def _list_args(**overrides) -> argparse.Namespace:
+    defaults = dict(remote=True, config=None, fast=False, target_mcu="nrf52833")
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class TestCmdListRemote:
+    def test_prints_table_with_host_column_matching_each_row(self, monkeypatch, capsys):
+        rows = [
+            {"enum": "0", "name": "togov", "common": "", "role": "",
+             "uid": "u1", "host": "192.168.1.10"},
+            {"enum": "1", "name": "solob", "common": "Relay1", "role": "relay",
+             "uid": "u2", "host": "192.168.1.20"},
+        ]
+        monkeypatch.setattr(remote_mod, "list_remote", lambda timeout=2.0: rows)
+
+        rc = cli_mod._cmd_list(_list_args())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "HOST" in out
+        assert "CONN" not in out
+        assert "PORT" not in out
+        for row in rows:
+            line = next(line for line in out.splitlines() if row["uid"] in line)
+            assert row["host"] in line
+            assert row["name"] in line
+
+    def test_empty_remote_result_prints_an_empty_table_and_exits_zero(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(remote_mod, "list_remote", lambda timeout=2.0: [])
+
+        rc = cli_mod._cmd_list(_list_args())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        lines = out.splitlines()
+        assert "HOST" in lines[0]
+        assert lines[1] == "-" * len(lines[0])
+        assert len(lines) == 2                    # header + rule, zero data rows
+        assert "no devices found" not in out
+
+    def test_fast_and_target_mcu_are_ignored_not_rejected(self, monkeypatch, capsys):
+        """--remote --fast must not error, and must not touch the debug probe
+        (list_remote() never reads a board name over SWD in the first place)."""
+        rows = [{"enum": "0", "name": "togov", "common": "", "role": "",
+                 "uid": "u1", "host": "192.168.1.10"}]
+        monkeypatch.setattr(remote_mod, "list_remote", lambda timeout=2.0: rows)
+
+        rc = cli_mod._cmd_list(_list_args(fast=True, target_mcu="nrf52840"))
+
+        assert rc == 0
+        assert "togov" in capsys.readouterr().out
+
+    def test_does_not_touch_local_devices_module(self, monkeypatch, capsys):
+        """--remote must never fall through to the local USB/registry path."""
+        import mbdeploy.devices as devices_mod
+
+        def _boom(*a, **k):
+            raise AssertionError("list --remote must not probe local USB devices")
+
+        monkeypatch.setattr(devices_mod, "flashable_probes", _boom)
+        monkeypatch.setattr(devices_mod, "load_devices", _boom)
+        monkeypatch.setattr(remote_mod, "list_remote", lambda timeout=2.0: [])
+
+        rc = cli_mod._cmd_list(_list_args())
+
+        assert rc == 0
+
+
+class TestListRemoteArgparse:
+    def test_remote_flag_parses_and_defaults_to_false(self):
+        parser = cli_mod._build_parser()
+
+        assert parser.parse_args(["list"]).remote is False
+        assert parser.parse_args(["list", "--remote"]).remote is True
+
+    def test_remote_is_documented_in_list_help(self, capsys):
+        parser = cli_mod._build_parser()
+
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["list", "--help"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "--remote" in out
+
+
+class TestPrintDeviceTableLocalOutputUnchanged:
+    """Guards the ticket's own acceptance criterion: local `list` output
+    must be byte-for-byte unchanged now that `_print_device_table` takes
+    an optional `remote` parameter."""
+
+    def test_default_call_is_identical_to_an_explicit_remote_false(self, capsys):
+        rows = [{
+            "enum": "0", "conn": "yes", "name": "togov", "common": "",
+            "role": "", "port": "/dev/cu.usbmodem1", "uid": "u1",
+        }]
+
+        cli_mod._print_device_table(rows)
+        default_out = capsys.readouterr().out
+
+        cli_mod._print_device_table(rows, remote=False)
+        explicit_out = capsys.readouterr().out
+
+        assert default_out == explicit_out
+        assert "CONN" in default_out
+        assert "PORT" in default_out
+        assert "HOST" not in default_out

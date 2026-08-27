@@ -50,6 +50,17 @@ from mbdeploy import console, mdns
 #: treated as an unrelated non-match and letting the collision through.
 _DEDUPE_SUFFIX_RE = re.compile(r" \(\d+\)$")
 
+#: The two mDNS service types this module's client functions browse.
+#: Duplicated literally from ``server.py``'s own ``SERIAL_SERVICE_TYPE``/
+#: ``FLASH_SERVICE_TYPE`` rather than imported from it -- this module's
+#: boundary (sprint.md Step 3) is "never imports server.py; it is a wire
+#: peer, not a caller, of the module it talks to." These two strings are
+#: part of the wire protocol this module's client code implements, the
+#: same reason ``tests/test_remote.py`` already redefines its own
+#: ``SERVICE_TYPE`` constant rather than importing ``server``'s.
+SERIAL_SERVICE_TYPE = "_mbserial._tcp.local."
+FLASH_SERVICE_TYPE = "_mbflash._tcp.local."
+
 
 class SocketSerial:
     """Adapter around a connected ``socket.socket``, usable anywhere
@@ -283,3 +294,78 @@ def resolve_board(name: str, service_type: str, timeout: float = 2.0) -> dict:
             f"{service_type}: {candidates}"
         )
     return matches[0]
+
+
+def _txt_field(txt: dict, key: str) -> str:
+    """Return ``txt[key]`` as a ``str``, or ``""`` if missing/empty/``None``.
+
+    ``server.py::_service_txt`` always writes a ``str`` (even converting
+    ``enum`` with ``str(...)``), but this helper does not trust that --
+    a stubbed ``mdns.browse()`` in a test, or a future TXT producer, may
+    hand back ``None`` or a non-``str`` value, and a bare ``value or ""``
+    would (wrongly) treat the *string* ``"0"`` as present but an *int*
+    ``0`` as missing.
+    """
+    value = txt.get(key)
+    return "" if value in (None, "") else str(value)
+
+
+def list_remote(timeout: float = 2.0) -> list[dict]:
+    """Browse both service types; return one row per board, HOST included.
+
+    Calls ``mdns.browse()`` once for :data:`SERIAL_SERVICE_TYPE` and once
+    for :data:`FLASH_SERVICE_TYPE`, and groups the combined results by TXT
+    ``uid`` -- the one field both of a board's two registrations share
+    (``server.py::_service_txt`` writes the same ``uid`` into both). A
+    board that only answers on one of the two service types (its ``serve``
+    process has only one listener up, or a poll caught it mid-registration)
+    still produces exactly one row, built from whichever registration(s)
+    were actually seen; a field missing from one is filled in from the
+    other if present there.
+
+    A result with no TXT ``uid`` at all (should not happen in practice --
+    ``server.py`` always sets one, but ``browse()``'s own contract makes no
+    such guarantee) falls back to grouping by its recovered short name
+    instead, so two such entries are not silently merged into one row just
+    because both happened to omit ``uid``.
+
+    Each row is shaped like the existing local device table's own row dict
+    (``enum``, ``name``, ``common``, ``role``, ``uid`` -- see ``cli.py``'s
+    ``_device_rows``) plus a ``host`` field. Deliberately no ``port``: a
+    joined row can carry two different network ports (one per service
+    type), and neither is the one right value for a column that used to
+    mean "the local serial device path" -- ``host`` is the new information
+    worth showing instead.
+
+    Rows are sorted by (short name, uid) for a stable, deterministic
+    listing -- ``mdns.browse()``'s own result order is a dict's insertion
+    order from a background listener thread, not something a caller
+    should rely on.
+
+    Never returns ``None``; nothing found on either service type is ``[]``.
+    """
+    grouped: dict[str, dict] = {}
+    order: list[str] = []
+    for service_type in (SERIAL_SERVICE_TYPE, FLASH_SERVICE_TYPE):
+        for entry in mdns.browse(service_type, timeout):
+            txt = entry.get("txt") or {}
+            name = _short_name(entry.get("name", ""), service_type)
+            key = _txt_field(txt, "uid") or f"name:{name}"
+            fields = {
+                "enum": _txt_field(txt, "enum"),
+                "name": name,
+                "common": _txt_field(txt, "common_name"),
+                "role": _txt_field(txt, "role"),
+                "uid": _txt_field(txt, "uid"),
+                "host": entry.get("host") or "",
+            }
+            if key not in grouped:
+                grouped[key] = fields
+                order.append(key)
+            else:
+                row = grouped[key]
+                for field_name, value in fields.items():
+                    row[field_name] = row[field_name] or value
+    rows = [grouped[key] for key in order]
+    rows.sort(key=lambda r: (r["name"], r["uid"]))
+    return rows

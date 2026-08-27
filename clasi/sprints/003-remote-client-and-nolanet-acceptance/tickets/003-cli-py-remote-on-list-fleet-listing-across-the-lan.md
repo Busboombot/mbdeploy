@@ -1,9 +1,11 @@
 ---
 id: '003'
 title: 'cli.py: --remote on list (fleet listing across the LAN)'
-status: open
-use-cases: [SUC-010]
-depends-on: ['002']
+status: in-progress
+use-cases:
+- SUC-010
+depends-on:
+- '002'
 github-issue: ''
 issue: mbdeploy-serve-a-network-facing-micro-bit-fleet-daemon.md
 completes_issue: true
@@ -31,12 +33,12 @@ rather than inventing a second table format.
 
 ## Acceptance Criteria
 
-- [ ] `remote.list_remote()` groups a stubbed `mdns.browse()`'s
+- [x] `remote.list_remote()` groups a stubbed `mdns.browse()`'s
       multi-service results into one row per board, by `uid`.
-- [ ] `mbdeploy list --remote` prints a table with a HOST column; the
+- [x] `mbdeploy list --remote` prints a table with a HOST column; the
       existing local `mbdeploy list` output is byte-for-byte unchanged
       when `--remote` is omitted.
-- [ ] `--fast`/`--target-mcu` (local-only flags) are rejected or
+- [x] `--fast`/`--target-mcu` (local-only flags) are rejected or
       ignored consistently with `--remote`'s "no local registry
       involved" nature — document whichever choice is made in the
       `--help` text for `--remote`.

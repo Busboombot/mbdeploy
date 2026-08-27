@@ -332,13 +332,37 @@ _TABLE_HEADER = _ROW_FMT.format(
     role="ROLE", port="PORT", uid="UID",
 )
 
+# `list --remote`'s table: no CONN/PORT columns (meaningless for a board
+# reached only via mDNS -- every row is, by construction, currently
+# advertising, and a board joining both service types can carry two
+# different network ports, neither of which is the one right value for a
+# column that used to mean "the local serial device path"), a HOST column
+# in their place. Same style as `_ROW_FMT` (same column ordering/widths
+# for the columns the two tables share), not a second table format.
+_REMOTE_ROW_FMT = (
+    "{enum:<5} {name:<12} {common:<12} {role:<13} {host:<24} {uid}"
+)
+_REMOTE_TABLE_HEADER = _REMOTE_ROW_FMT.format(
+    enum="ENUM", name="DEVICE NAME", common="COMMON NAME",
+    role="ROLE", host="HOST", uid="UID",
+)
 
-def _print_device_table(rows: list[dict]) -> None:
-    """Print the shared `list` / `probe` table, connected devices first."""
-    print(_TABLE_HEADER)
-    print("-" * len(_TABLE_HEADER))
+
+def _print_device_table(rows: list[dict], remote: bool = False) -> None:
+    """Print the shared `list` / `probe` / `list --remote` table.
+
+    `remote=False` (the default -- every existing caller) is byte-for-byte
+    unchanged from before this parameter existed: same header, same
+    `_ROW_FMT`, same output for the same rows. `remote=True` (`list
+    --remote` only) swaps in `_REMOTE_ROW_FMT`/`_REMOTE_TABLE_HEADER`
+    instead, adding the HOST column described above.
+    """
+    header = _REMOTE_TABLE_HEADER if remote else _TABLE_HEADER
+    row_fmt = _REMOTE_ROW_FMT if remote else _ROW_FMT
+    print(header)
+    print("-" * len(header))
     for row in rows:
-        print(_ROW_FMT.format(**row))
+        print(row_fmt.format(**row))
 
 
 def _device_rows(
@@ -383,7 +407,34 @@ def _device_rows(
     return rows
 
 
+def _cmd_list_remote(args: argparse.Namespace) -> int:
+    """`list --remote`: browse the LAN instead of local USB devices.
+
+    No local registry, no `devices_mod` import, no target argument --
+    `remote.list_remote()` already returns exactly the rows to print.
+    `--fast`/`--target-mcu` are local-only (they control the SWD name
+    read `list_remote()` never performs -- board names come from mDNS,
+    not a debug probe) and are silently ignored here, per this ticket's
+    `--remote` `--help` text.
+
+    Unlike local `list`, an empty result prints an empty table (header
+    plus zero rows) rather than "no devices found": no boards currently
+    advertising on the LAN is an unremarkable, momentary state for a
+    network listing (nothing is unplugged, there is simply nothing to
+    show right now), not the same as a *local* board that was probed and
+    should still be sitting in the registry.
+    """
+    from mbdeploy import remote as remote_mod
+
+    rows = remote_mod.list_remote()
+    _print_device_table(rows, remote=True)
+    return 0
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
+    if getattr(args, "remote", False):
+        return _cmd_list_remote(args)
+
     import mbdeploy.devices as devices_mod
 
     config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
@@ -999,6 +1050,14 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="target_mcu",
         default=_DEFAULT_MCU,
         help=f"Target MCU type used when reading board names (default: {_DEFAULT_MCU}).",
+    )
+    list_p.add_argument(
+        "--remote",
+        action="store_true",
+        help="List boards currently advertising on the LAN via mDNS instead "
+             "of local USB devices; no local registry is used and no target "
+             "argument is taken. --fast/--target-mcu are ignored in this "
+             "mode (list --remote never reads a board name over SWD).",
     )
     list_p.set_defaults(func=_cmd_list)
 
