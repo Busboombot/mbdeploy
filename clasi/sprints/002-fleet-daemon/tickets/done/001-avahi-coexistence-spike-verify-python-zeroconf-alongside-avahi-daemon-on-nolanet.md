@@ -2,7 +2,7 @@
 id: '001'
 title: 'Avahi coexistence spike: verify python-zeroconf alongside avahi-daemon on
   Nolanet'
-status: in-progress
+status: done
 use-cases:
 - SUC-009
 depends-on: []
