@@ -1,7 +1,7 @@
 ---
 id: 008
 title: Systemd system-unit service templates and --print-service/--install-service
-status: in-progress
+status: done
 use-cases:
 - SUC-007
 depends-on:
