@@ -1,7 +1,7 @@
 ---
 id: '003'
 title: 'cli.py: --remote on list (fleet listing across the LAN)'
-status: in-progress
+status: done
 use-cases:
 - SUC-010
 depends-on:
