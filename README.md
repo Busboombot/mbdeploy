@@ -77,8 +77,24 @@ udev details specific to headless boards.
 | `list`     | List all known micro:bit devices and whether each is connected. Use `--fast` to skip reading names over SWD. |
 | `probe`    | Probe all connected devices and update the registry. Use `--clear` to rebuild it from live devices only. |
 | `connect`  | Open a serial connection to a board, or send it one line and print the reply. |
+| `serve`    | Run the fleet daemon: watch USB and advertise each board's serial/flash services over mDNS. |
 
 Run `mbdeploy --help` or `mbdeploy <subcommand> --help` for full usage.
+
+## Serving a fleet over the network
+
+`serve` turns this host into a daemon: it watches USB and advertises
+each connected board's serial port and flash access over mDNS
+(`_mbserial._tcp` / `_mbflash._tcp`), so another machine on the LAN can
+reach it with `--remote` on `list`, `connect`, and `deploy` — the same
+target syntax as the local commands, resolved over mDNS instead of a
+local registry. `--remote` is mutually exclusive with a `/dev/…` target
+(rejected before any network I/O), and `deploy --remote` requires an
+explicit target since there is no local registry of remote boards to
+auto-pick from. See "Serving a fleet over the network" in
+`mbdeploy --agent` for the wire protocol, access controls
+(`--token`/`--token-file`/`--no-flash`), and systemd deployment
+(`--print-service`/`--install-service`).
 
 ## Talking to a board
 
