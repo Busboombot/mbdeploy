@@ -1,7 +1,7 @@
 ---
 id: '002'
 title: Extract flash_hex into src/mbdeploy/flash.py
-status: in-progress
+status: done
 use-cases:
 - UC-005
 - UC-006
