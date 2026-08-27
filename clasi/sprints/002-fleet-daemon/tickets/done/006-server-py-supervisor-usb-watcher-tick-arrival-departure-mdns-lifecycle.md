@@ -1,7 +1,7 @@
 ---
 id: '006'
 title: 'server.py: Supervisor USB watcher (_tick, arrival/departure, mDNS lifecycle)'
-status: in-progress
+status: done
 use-cases:
 - SUC-003
 depends-on:
