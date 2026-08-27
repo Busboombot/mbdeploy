@@ -198,14 +198,15 @@ def _deploy_entry(target: str, registry: dict[str, dict]) -> dict:
 
     A ``/dev/...`` path is not, and is deliberately **not** looked up in the
     registry: a recorded ``port`` is only as fresh as the last ``probe``, and
-    macOS re-issues ``/dev/cu.usbmodem*`` names on every reconnect.  Matching
-    one would return the board that *used to* sit on that path, and ``deploy``
-    would then flash that board's UID — writing firmware to a different,
-    currently-connected board than the path names.  ``connect`` sidesteps this
-    by opening the path verbatim (see :func:`_connect_port`); ``deploy`` cannot,
-    because pyOCD addresses a board by UID, so the path is translated through
-    the *live* ``ioreg`` mapping instead: whichever board is on that port right
-    now is the one that gets flashed.
+    the OS re-issues serial port names (e.g. ``/dev/cu.usbmodem*`` on macOS)
+    on every reconnect.  Matching one would return the board that *used to*
+    sit on that path, and ``deploy`` would then flash that board's UID —
+    writing firmware to a different, currently-connected board than the path
+    names.  ``connect`` sidesteps this by opening the path verbatim (see
+    :func:`_connect_port`); ``deploy`` cannot, because pyOCD addresses a
+    board by UID, so the path is translated through the *live* serial-port
+    mapping instead (a ``pyserial`` VID:PID scan, on macOS or Linux alike):
+    whichever board is on that port right now is the one that gets flashed.
 
     That live UID must still be present in the registry.  The entry is where
     ``role`` comes from, and ``role`` is what the relay guard reads, so
@@ -219,8 +220,8 @@ def _deploy_entry(target: str, registry: dict[str, dict]) -> dict:
     if not (target.startswith("/dev/") or "/" in target):
         return devices_mod.resolve_target(target, registry)
 
-    # Restrict the ioreg scan to connected CMSIS-DAP probes so some other
-    # USB serial device can never be mistaken for a micro:bit.
+    # Restrict the live serial-port scan to connected CMSIS-DAP probes so
+    # some other USB serial device can never be mistaken for a micro:bit.
     known = {p["uid"] for p in devices_mod.flashable_probes()}
     live_ports = devices_mod.port_serial_map(known)
 
