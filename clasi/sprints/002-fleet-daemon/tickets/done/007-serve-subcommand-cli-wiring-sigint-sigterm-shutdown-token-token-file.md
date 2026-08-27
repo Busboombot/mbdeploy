@@ -1,7 +1,7 @@
 ---
 id: '007'
 title: 'serve subcommand: CLI wiring, SIGINT/SIGTERM shutdown, --token/--token-file'
-status: in-progress
+status: done
 use-cases:
 - SUC-003
 - SUC-004
