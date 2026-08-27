@@ -147,16 +147,54 @@ def probe_type(port: str, timeout_s: float = 1.6) -> dict[str, str] | None:
             if not raw:
                 continue
             text = raw.decode("utf-8", "ignore").strip()
+            # TWO announcement dialects, same five fields in the same
+            # order -- sentinel, role, common_name, device_name, serial:
+            #
+            #   relay  DEVICE:RADIOBRIDGE:relay:getez:1779042496
+            #          (microbit-radio-relay/docs/announce.md)
+            #   robot  device NEZHA2 robot vevov 1198504156
+            #          (radio-robot-lib/docs/design/protocol.md S6)
+            #
+            # Only the colon dialect was accepted until 2026-08-27, so
+            # every ROBOT failed to type: probe_type returned None,
+            # probe_all took its preserve-existing-fields branch, and
+            # role/common_name/device_name/serial were never written.
+            # The DEVICE NAME column still filled in, because board_name
+            # comes from the separate SWD path (read_device_id ->
+            # friendly_name), which masked the gap.
+            #
+            # Consequence in the field: a robot kept whatever stale role
+            # its registry entry last held. vevov, reflashed from relay
+            # to robot firmware, stayed labelled RADIOBRIDGE, and
+            # `mbdeploy deploy vevov` refused with "relay is a relay"
+            # on a board that had been a robot for days.
+            #
+            # The robot dialect is space-delimited and lowercase because
+            # the v6 wire protocol dropped ':' as a field separator when
+            # it retired v5 (pxt-nezha-diffdrive dfca4f8, 2026-08-23);
+            # the announcement line went with it. This parser was never
+            # updated to follow.
+            fields = None
             if text.startswith("DEVICE:"):
                 parts = text.split(":")
                 if len(parts) >= 5:
-                    return {
-                        "role": parts[1],
-                        "common_name": parts[2],
-                        "device_name": parts[3],
-                        "serial": ":".join(parts[4:]),
-                        "raw": text,
-                    }
+                    # Serial may itself contain ':' -- rejoin the tail.
+                    fields = (parts[1], parts[2], parts[3], ":".join(parts[4:]))
+            elif text.startswith("device "):
+                parts = text.split()
+                if len(parts) >= 5:
+                    # Space-delimited: the serial is a single bare token
+                    # (the decimal FICR.DEVICEID[1]), so any extra
+                    # trailing tokens are not part of it and are ignored.
+                    fields = (parts[1], parts[2], parts[3], parts[4])
+            if fields is not None:
+                return {
+                    "role": fields[0],
+                    "common_name": fields[1],
+                    "device_name": fields[2],
+                    "serial": fields[3],
+                    "raw": text,
+                }
         return None
     except Exception:
         return None
