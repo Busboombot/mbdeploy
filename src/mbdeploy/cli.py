@@ -6,6 +6,7 @@ import argparse
 import shlex
 import shutil
 import signal
+import socket
 import sys
 import threading
 from importlib import resources
@@ -27,6 +28,16 @@ _DEFAULT_MCU = "nrf52833"
 # import the device layer (and pyserial) on every invocation.
 _DEFAULT_BAUD = 115200
 _DEFAULT_CONNECT_TIMEOUT = 2.0
+
+#: How long `connect --remote` waits, right after connecting, to see
+#: whether the daemon sent an immediate `ERR ...` line (e.g. `ERR busy`
+#: from a second client racing an already-claimed board) before treating
+#: the connection as a normal session. Short: a real `ERR ...` line is
+#: the very first (and only) thing `serve_serial` ever writes before a
+#: raw relay begins, sent synchronously on accept -- this only has to
+#: cover one LAN round trip, not whatever pace a real board talks at
+#: afterwards. Module-level so a test can `monkeypatch.setattr` it small.
+_REMOTE_ERR_PEEK_TIMEOUT = 0.3
 
 # Mirrors server.DEFAULT_POLL_INTERVAL, kept here for the same reason: building
 # the parser (and printing --help) shouldn't have to import mbdeploy.server
@@ -332,13 +343,37 @@ _TABLE_HEADER = _ROW_FMT.format(
     role="ROLE", port="PORT", uid="UID",
 )
 
+# `list --remote`'s table: no CONN/PORT columns (meaningless for a board
+# reached only via mDNS -- every row is, by construction, currently
+# advertising, and a board joining both service types can carry two
+# different network ports, neither of which is the one right value for a
+# column that used to mean "the local serial device path"), a HOST column
+# in their place. Same style as `_ROW_FMT` (same column ordering/widths
+# for the columns the two tables share), not a second table format.
+_REMOTE_ROW_FMT = (
+    "{enum:<5} {name:<12} {common:<12} {role:<13} {host:<24} {uid}"
+)
+_REMOTE_TABLE_HEADER = _REMOTE_ROW_FMT.format(
+    enum="ENUM", name="DEVICE NAME", common="COMMON NAME",
+    role="ROLE", host="HOST", uid="UID",
+)
 
-def _print_device_table(rows: list[dict]) -> None:
-    """Print the shared `list` / `probe` table, connected devices first."""
-    print(_TABLE_HEADER)
-    print("-" * len(_TABLE_HEADER))
+
+def _print_device_table(rows: list[dict], remote: bool = False) -> None:
+    """Print the shared `list` / `probe` / `list --remote` table.
+
+    `remote=False` (the default -- every existing caller) is byte-for-byte
+    unchanged from before this parameter existed: same header, same
+    `_ROW_FMT`, same output for the same rows. `remote=True` (`list
+    --remote` only) swaps in `_REMOTE_ROW_FMT`/`_REMOTE_TABLE_HEADER`
+    instead, adding the HOST column described above.
+    """
+    header = _REMOTE_TABLE_HEADER if remote else _TABLE_HEADER
+    row_fmt = _REMOTE_ROW_FMT if remote else _ROW_FMT
+    print(header)
+    print("-" * len(header))
     for row in rows:
-        print(_ROW_FMT.format(**row))
+        print(row_fmt.format(**row))
 
 
 def _device_rows(
@@ -383,7 +418,34 @@ def _device_rows(
     return rows
 
 
+def _cmd_list_remote(args: argparse.Namespace) -> int:
+    """`list --remote`: browse the LAN instead of local USB devices.
+
+    No local registry, no `devices_mod` import, no target argument --
+    `remote.list_remote()` already returns exactly the rows to print.
+    `--fast`/`--target-mcu` are local-only (they control the SWD name
+    read `list_remote()` never performs -- board names come from mDNS,
+    not a debug probe) and are silently ignored here, per this ticket's
+    `--remote` `--help` text.
+
+    Unlike local `list`, an empty result prints an empty table (header
+    plus zero rows) rather than "no devices found": no boards currently
+    advertising on the LAN is an unremarkable, momentary state for a
+    network listing (nothing is unplugged, there is simply nothing to
+    show right now), not the same as a *local* board that was probed and
+    should still be sitting in the registry.
+    """
+    from mbdeploy import remote as remote_mod
+
+    rows = remote_mod.list_remote()
+    _print_device_table(rows, remote=True)
+    return 0
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
+    if getattr(args, "remote", False):
+        return _cmd_list_remote(args)
+
     import mbdeploy.devices as devices_mod
 
     config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
@@ -518,13 +580,69 @@ def _deploy_entry(target: str, registry: dict[str, dict]) -> dict:
     return entry
 
 
-def _cmd_deploy(args: argparse.Namespace) -> int:
-    import mbdeploy.devices as devices_mod
+def _cmd_deploy_remote(
+    args: argparse.Namespace, hex_path: str, target_mcu: str, force_relay: bool
+) -> int:
+    """`deploy --remote`: build/clean locally exactly as today, then stream
+    the resulting hex over `_mbflash._tcp` instead of calling
+    `flash_mod.flash_hex` against a local USB connection.
 
-    config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
+    No registry lookup, no relay guard, no live-probe confirmation here --
+    all three are local-registry concerns this branch has no registry to
+    perform them against; the relay guard in particular is still enforced,
+    just server-side (`serve_flash`'s existing `is_relay(...)` check),
+    since only the daemon knows the remote board's `role`. `--build`/
+    `--clean` run first and unchanged (same `builder.run` call, same
+    argument names) so a remote deploy builds from the exact same source
+    a local one would, before anything touches the network.
+    """
+    if args.build or args.clean:
+        from mbdeploy import builder
+
+        rc = builder.run(
+            clean=args.clean,
+            verbose=getattr(args, "verbose", False),
+            jobs=args.jobs,
+        )
+        if rc != 0:
+            print(f"Error: build failed (exit {rc}).", file=sys.stderr)
+            return rc
+
+    from mbdeploy import remote as remote_mod
+
+    return remote_mod.deploy_over_network(
+        args.target, hex_path, target_mcu, force_relay=force_relay,
+    )
+
+
+def _cmd_deploy(args: argparse.Namespace) -> int:
+    remote = getattr(args, "remote", False)
+    if remote and args.target and (args.target.startswith("/dev/") or "/" in args.target):
+        print(
+            f"Error: --remote cannot be combined with a device path "
+            f"('{args.target}').",
+            file=sys.stderr,
+        )
+        return 1
+    if remote and not args.target:
+        print(
+            "Error: --remote requires a target board name -- unlike local "
+            "deploy, there is no local registry of remote boards to "
+            "auto-pick from.",
+            file=sys.stderr,
+        )
+        return 1
+
     hex_path = args.hex if args.hex else _DEFAULT_HEX
     target_mcu = args.target_mcu if args.target_mcu else _DEFAULT_MCU
     force_relay = args.force_relay
+
+    if remote:
+        return _cmd_deploy_remote(args, hex_path, target_mcu, force_relay)
+
+    import mbdeploy.devices as devices_mod
+
+    config_path = Path(args.config) if args.config else _DEFAULT_CONFIG
 
     # --- resolve device entry ---
     registry = devices_mod.load_devices(config_path)
@@ -619,7 +737,131 @@ def _connect_port(target: str, registry: dict[str, dict]) -> str:
     return port
 
 
+def _run_connect_session(
+    ser: Any, args: argparse.Namespace, *, banner_target: str, error_target: str
+) -> int:
+    """Run `connect`'s one-shot or interactive session against an
+    already-open `ser`, closing it before returning.
+
+    Shared by local `connect` and `connect --remote`: both hand this
+    something satisfying `console.py`'s duck-typed serial contract -- a
+    real pyserial port for the local path, a `remote.SocketSerial`
+    wrapping a connected TCP socket for `--remote` -- and this function
+    never branches on which one it got (sprint.md Step 3's R2: zero
+    lines of `console.py` change, and no new branching outside
+    `_cmd_connect`'s own port-vs-socket setup). `banner_target`/
+    `error_target` let each caller phrase "connected to ..."/"no
+    response from ..." in whatever way fits its own address space (a
+    port-and-baud pair locally, a resolved board-and-host:port remotely)
+    without this function needing to know which case it is in.
+    """
+    from mbdeploy import console
+
+    try:
+        if not args.message:
+            print(
+                f"connected to {banner_target} — Ctrl-D or Ctrl-C to exit",
+                file=sys.stderr,
+            )
+            return console.interact(ser)
+
+        # One-shot: the reply is the command's output, so it goes to stdout
+        # while every status line goes to stderr.
+        lines = console.send_command(
+            ser, " ".join(args.message), timeout=args.timeout
+        )
+        for line in lines:
+            print(line)
+        if not lines:
+            print(
+                f"Error: no response from {error_target} within {args.timeout:g}s.",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    finally:
+        ser.close()
+
+
+def _peek_remote_err(sock: socket.socket, timeout: float) -> str | None:
+    """Return the message text of an immediate `ERR ...` line the daemon
+    sent, if any, without consuming it off `sock`.
+
+    Uses `socket.MSG_PEEK` deliberately: `serve_serial`'s raw byte pipe is
+    unframed (the issue's own "No handshake" wire-protocol note), so
+    anything read here that turns out *not* to be a pre-relay `ERR ...`
+    line must be left exactly where `console.py`'s own reads will find
+    it -- a real board's first bytes of ordinary output are not this
+    function's to consume. A read timeout (nothing arrived within
+    `timeout`) is the overwhelmingly common case -- every Nolanet board
+    is silent, and no board speaks before it is spoken to -- and is not
+    an error: returns `None` so the caller proceeds to a normal session.
+    """
+    sock.settimeout(timeout)
+    try:
+        peek = sock.recv(4096, socket.MSG_PEEK)
+    except (socket.timeout, OSError):
+        return None
+    if not peek.startswith(b"ERR "):
+        return None
+    line = peek.split(b"\n", 1)[0]
+    return line[len(b"ERR "):].decode("utf-8", "replace")
+
+
+def _cmd_connect_remote(args: argparse.Namespace) -> int:
+    """`connect --remote`: resolve a board over mDNS and open a TCP
+    session instead of a local serial port.
+
+    Resolves `args.target` against `_mbserial._tcp` via
+    `remote.resolve_board`, opens a socket to the resolved
+    `{host, port}`, and wraps it in `remote.SocketSerial` -- the adapter
+    that lets `console.send_command()`/`console.interact()` run
+    completely unmodified against a network connection instead of a real
+    pyserial port. `--baud` is meaningless here -- the daemon already has
+    the board's local serial port open at whatever baud `serve` was
+    started with -- and is silently ignored, per this flag's own
+    `--help` text.
+    """
+    from mbdeploy import remote as remote_mod
+
+    try:
+        board = remote_mod.resolve_board(args.target, remote_mod.SERIAL_SERVICE_TYPE)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    host, port = board["host"], board["port"]
+    label = f"{board['name']} ({host}:{port})"
+
+    try:
+        sock = socket.create_connection((host, port), timeout=args.timeout)
+    except OSError as exc:
+        print(f"Error: cannot connect to {label}: {exc}", file=sys.stderr)
+        return 1
+
+    err = _peek_remote_err(sock, _REMOTE_ERR_PEEK_TIMEOUT)
+    if err is not None:
+        sock.close()
+        print(f"Error: {label} refused the connection: {err}", file=sys.stderr)
+        return 1
+
+    ser = remote_mod.SocketSerial(sock)
+    return _run_connect_session(ser, args, banner_target=label, error_target=label)
+
+
 def _cmd_connect(args: argparse.Namespace) -> int:
+    remote = getattr(args, "remote", False)
+    if remote and (args.target.startswith("/dev/") or "/" in args.target):
+        print(
+            f"Error: --remote cannot be combined with a device path "
+            f"('{args.target}').",
+            file=sys.stderr,
+        )
+        return 1
+
+    if remote:
+        return _cmd_connect_remote(args)
+
     import mbdeploy.devices as devices_mod
     from mbdeploy import console
 
@@ -638,31 +880,11 @@ def _cmd_connect(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    try:
-        if not args.message:
-            print(
-                f"connected to {port} at {args.baud} baud "
-                "— Ctrl-D or Ctrl-C to exit",
-                file=sys.stderr,
-            )
-            return console.interact(ser)
-
-        # One-shot: the reply is the command's output, so it goes to stdout
-        # while every status line goes to stderr.
-        lines = console.send_command(
-            ser, " ".join(args.message), timeout=args.timeout
-        )
-        for line in lines:
-            print(line)
-        if not lines:
-            print(
-                f"Error: no response from {port} within {args.timeout:g}s.",
-                file=sys.stderr,
-            )
-            return 1
-        return 0
-    finally:
-        ser.close()
+    return _run_connect_session(
+        ser, args,
+        banner_target=f"{port} at {args.baud} baud",
+        error_target=port,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1202,17 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy_p.add_argument(
         "--config", metavar="PATH", help="Path to device config file."
     )
+    deploy_p.add_argument(
+        "--remote",
+        action="store_true",
+        help="Resolve target as a board name currently advertising "
+             "_mbflash._tcp on the LAN via mDNS, and flash it over the "
+             "network instead of a local USB connection. --build/--clean "
+             "still run locally, unchanged, before the network exchange "
+             "starts. Mutually exclusive with a /dev/... target and "
+             "requires a target (no local registry to auto-pick from) -- "
+             "both rejected before any mDNS lookup or socket I/O.",
+    )
     deploy_p.set_defaults(func=_cmd_deploy)
 
     # --- list ---
@@ -999,6 +1232,14 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="target_mcu",
         default=_DEFAULT_MCU,
         help=f"Target MCU type used when reading board names (default: {_DEFAULT_MCU}).",
+    )
+    list_p.add_argument(
+        "--remote",
+        action="store_true",
+        help="List boards currently advertising on the LAN via mDNS instead "
+             "of local USB devices; no local registry is used and no target "
+             "argument is taken. --fast/--target-mcu are ignored in this "
+             "mode (list --remote never reads a board name over SWD).",
     )
     list_p.set_defaults(func=_cmd_list)
 
@@ -1044,7 +1285,9 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_DEFAULT_BAUD,
         metavar="N",
-        help=f"Serial baud rate (default: {_DEFAULT_BAUD}).",
+        help=f"Serial baud rate (default: {_DEFAULT_BAUD}). Ignored by "
+             "--remote -- the daemon already has the board's local port "
+             "open at whatever baud it was started with.",
     )
     connect_p.add_argument(
         "--timeout",
@@ -1056,6 +1299,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     connect_p.add_argument(
         "--config", metavar="PATH", help="Path to device config file."
+    )
+    connect_p.add_argument(
+        "--remote",
+        action="store_true",
+        help="Resolve target as a board name currently advertising "
+             "_mbserial._tcp on the LAN via mDNS, and connect to it over "
+             "the network instead of a local serial port. Mutually "
+             "exclusive with a /dev/... target -- rejected before any "
+             "mDNS lookup or socket I/O. --baud is ignored in this mode.",
     )
     connect_p.set_defaults(func=_cmd_connect)
 

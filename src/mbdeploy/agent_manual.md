@@ -56,6 +56,7 @@ subcommand.
 | `list`     | List every known device, connected or not, with names from the saved registry. |
 | `probe`    | Actively probe every connected device and update the registry. Use `--clear` to rebuild it from live devices only. |
 | `connect`  | Open a serial session with a device, or send it one line and print the reply. |
+| `serve`    | Run the fleet daemon: watch USB and advertise each board's serial/flash services over mDNS (see §9). |
 
 Both `list` and `probe` print the same table:
 
@@ -443,3 +444,293 @@ per-read timeout:
 - **Use `connect` to check firmware, not `probe`.** `probe` rewrites the
   registry; `connect` only reads. To confirm a board is alive after a deploy,
   `mbdeploy connect <target> HELLO` and check the exit code.
+
+---
+
+## 9. Serving a fleet over the network
+
+`serve` turns this host into a network-facing daemon for every micro:bit
+plugged into it. A USB watcher keeps a live per-board state in sync with
+what's actually connected, and each connected board gets two independent
+mDNS-advertised TCP services — a raw serial relay and a flash-over-the-
+network protocol — so `list --remote`, `connect --remote`, and
+`deploy --remote` run from another machine on the LAN can reach it
+without that machine having any local registry entry, or even a USB
+connection, for the board at all.
+
+```bash
+mbdeploy serve
+```
+
+runs in the foreground until SIGINT/SIGTERM (systemd sends SIGTERM on
+stop). On either signal it unregisters every mDNS advertisement and
+closes every listener socket before exiting — it never self-daemonizes
+and never writes a pidfile; §9.6 below is how you actually run it as a
+background service.
+
+### 9.1 The two mDNS services and how a board is named
+
+Each connected board is advertised under two service types, rooted at
+the same instance name:
+
+| Service type | Purpose | Wire protocol |
+|---|---|---|
+| `_mbserial._tcp.local.` | Raw serial pass-through | §9.2 |
+| `_mbflash._tcp.local.`  | Flash-over-network + status | §9.3 |
+
+The instance name — what you pass as `target` to `--remote` — is chosen
+once, when the board first shows up, from this fallback chain:
+
+1. **`board_name`** — the five-letter name read over SWD during arrival
+   (§3.1). This is the path that actually runs in production on
+   Nolanet: all four boards there run no announcing firmware, so this
+   is not a rarely-hit fallback — it's the only identity source that
+   works for them.
+2. **`device_name`** — from a `DEVICE:` announcement, used if the SWD
+   read failed.
+3. **`mb-<last 8 of uid>`** — last resort, so a board is always
+   nameable even with neither of the above.
+
+`--service-name NAME` (a `serve` flag) overrides this chain entirely,
+for every board that process manages. Only meaningful for a
+single-board host (Nolanet's case) — on a multi-board host every board
+would get the same name and collide, relying on zeroconf's own
+`name (2)` rename to tell them apart.
+
+Each service's TXT record carries `uid`, `role`, `common_name`, `enum`,
+and `port`. **`port` is the network TCP port for that specific service**
+(what `list --remote`/`resolve_board` connect to) — never the board's
+local `/dev/ttyACM0`, which is not exposed on the wire at all.
+
+### 9.2 `_mbserial._tcp`: the serial relay
+
+Connect to a board's serial-service port and (if the daemon was started
+with `--token`/`--token-file`) send `AUTH <token>\n`. What comes back is
+a **raw, unframed byte pipe** to the board's local serial port, opened
+at 115200 baud — `serve` has no `--baud` flag; the daemon always opens
+the port the same fixed way regardless of who connects. There is no
+other handshake: the first bytes you see are the board's own output,
+exactly as if you had run a local `connect`.
+
+- **Exclusive, never preempting.** A second connection while one is
+  already live gets `ERR busy` and is dropped immediately. A serial
+  session can never displace anything else occupying the board — only
+  an incoming `FLASH` can do that (§9.4).
+- **`AUTH`, only if configured.** The connection has 5s to send
+  `AUTH <token>\n`; a match gets `OK` and the session proceeds as above.
+  A missing, malformed, or wrong-token line gets `ERR auth required` and
+  the connection is closed — checked before anything else, including
+  the busy check.
+- **`connect --remote` cannot authenticate.** There is no `--token`
+  flag on `list`/`connect`/`deploy`; the `--remote` client side does not
+  send `AUTH`. Against a `serve --token`/`--token-file` daemon,
+  `connect --remote`/`deploy --remote` fail immediately with `auth
+  required`. `list --remote` is unaffected either way, because it never
+  opens either socket — it only reads mDNS TXT records, which are not
+  gated by the token at all.
+
+### 9.3 `_mbflash._tcp`: `INFO` and `FLASH`
+
+One command line, then — for `FLASH` — a binary payload:
+
+```
+INFO
+→ OK {"uid": "...", "board_name": "togov", "role": "", "port": "...", "connected": true}
+
+FLASH <nbytes> [sha256=<hex>] [force-relay]
+→ OK send
+  <exactly nbytes of raw hex bytes>
+→ LOG <pyocd progress line>        (zero or more, as flashing proceeds)
+→ OK flashed                        -- or, on failure --
+→ ERR <reason>
+```
+
+`INFO` never touches the board's occupant state — it answers
+identically whether the board is idle, mid-session, or mid-flash.
+`deploy --remote` always sends `sha256=<hex>` (computed client-side over
+the exact bytes being sent); `serve_flash` verifies it whenever present.
+
+Every `ERR` line `serve_flash` can send, verbatim, and what triggers it:
+
+| Line | When |
+|---|---|
+| `ERR auth required` | Missing/wrong `AUTH` (only checked if `--token`/`--token-file` is set) |
+| `ERR unknown command` | The command line is neither `INFO` nor `FLASH` |
+| `ERR flash disabled` | `--no-flash` is set — checked before the header is even parsed |
+| `ERR bad header` | The byte count is missing or non-numeric |
+| `ERR relay refused — send force-relay` | The board's `role` matches the relay guard and `force-relay` wasn't sent |
+| `ERR busy` | A flash is already in flight against this board (two flashes never race) |
+| `ERR short payload` | Fewer than the declared byte count arrived within 30s |
+| `ERR sha256 mismatch` | The declared hash doesn't match what was received |
+| `ERR flash failed (exit N)` | `pyocd flash`, including its mass-erase recovery (§6.5), still failed |
+
+`deploy --remote` maps `OK flashed` to exit 0 and any `ERR ...` to exit
+1, relaying every `LOG` line to stderr as it arrives so a multi-second
+flash shows progress instead of silence followed by a result.
+
+### 9.4 Board exclusivity and the flash-preempts-serial rule
+
+A board has exactly one occupant at a time: idle, a live serial session,
+or an in-flight flash.
+
+- A `FLASH` against an **idle** board, or one with an **in-flight
+  flash** already, behaves as §9.3 describes (claims it, or `ERR busy`).
+- A `FLASH` against a board with a **live serial session** **preempts**
+  it: the daemon tears the serial session down (closes its socket,
+  releases the local serial port) and waits up to 2s for it to actually
+  exit before proceeding with the flash. The serial client simply sees
+  its connection close — it is not told why. This is deliberate: a live
+  `connect --remote` session must never be able to block a
+  `deploy --remote` to the same board indefinitely.
+- **Unplugging** a board (USB departure) tears down whatever currently
+  occupies it — idle, session, or flash — the same way, and additionally
+  unregisters both mDNS advertisements and closes both listener sockets.
+  A client mid-session sees its connection drop; a client mid-flash sees
+  the connection drop with no terminal `OK`/`ERR` line at all.
+
+### 9.5 `--remote` on `list`, `connect`, `deploy`
+
+`--remote` is a plain flag on all three subcommands. No separate host
+argument and no config file — the existing `target` positional is
+reused as the board's mDNS instance name (§9.1) to resolve.
+
+```bash
+mbdeploy list --remote                            # every board currently advertising on the LAN
+mbdeploy connect --remote togov "HELLO"           # one-shot, over _mbserial._tcp
+mbdeploy connect --remote togov                   # interactive session
+mbdeploy deploy --remote togov --hex build/MICROBIT.hex
+mbdeploy deploy --remote togov --force-relay      # relay guard is server-side (§9.3); see the caveat below
+```
+
+`list --remote`'s table drops the local-only `CONN`/`PORT` columns (a
+board reached over mDNS is, by construction, live right now, and can
+carry two different network ports — one per service type, neither of
+which is "the" right value for a single PORT column) and adds a `HOST`
+column instead:
+
+```
+ENUM  DEVICE NAME  COMMON NAME  ROLE          HOST           UID
+      togov                                   192.168.1.42   99063602...
+```
+
+**Mutual exclusion with a device path**, checked before any mDNS lookup
+or socket I/O:
+
+- `connect --remote /dev/ttyACM0` and `deploy --remote /dev/ttyACM0`
+  both fail with `Error: --remote cannot be combined with a device path
+  ('/dev/ttyACM0').` — `--remote` names a board on the network, a
+  `/dev/...` path names a local device, and combining them can't mean
+  anything coherent.
+- `deploy --remote` with no target fails with `Error: --remote requires
+  a target board name -- unlike local deploy, there is no local
+  registry of remote boards to auto-pick from.`
+
+**Flags that are ignored, not rejected**, in `--remote` mode — each
+documented in its own `--help` text too:
+
+- `connect --remote --baud N`: the daemon already has the board's local
+  port open at whatever baud it started with (115200, fixed — see
+  §9.2); there is nothing for `--baud` to change from the client side.
+- `list --remote --fast` / `--target-mcu`: `list --remote` never reads a
+  board name over SWD in the first place (names come from mDNS, not a
+  debug probe), so there is no SWD read for `--fast` to skip.
+
+**The silent-board behavior — read this before assuming a bug.** A
+board running no announcing firmware answers nothing on its serial
+port, so `connect --remote <name> "HELLO"` gets no reply and exits 1.
+This is correct, by design — a local `connect` to the same unannounced
+board behaves identically — not a failure specific to `--remote`. All
+four Nolanet boards are currently in exactly this state
+(`role`/`common_name`/`device_name` are all empty strings). The mDNS
+instance name still works even so, because it comes from `board_name`,
+read over SWD independently of any firmware announcement (§9.1) — so
+`list --remote` and `deploy --remote` are fully demonstrable against a
+silent fleet even though a serial round-trip is not. Use `INFO`
+(§9.3) to confirm a silent board is present and connected without
+expecting it to say anything back.
+
+**The relay guard is inert on a silent board — a real limitation, not a
+defect to quietly work around.** `serve_flash`'s relay refusal reads
+`role` off the board's registry entry
+(`is_relay(board.entry.get("role"))`); on a board that has never
+announced, `role` is `""`, so `is_relay("")` is `False` and `FLASH` is
+never refused for being a relay, `--force-relay` or not. On a fleet of
+silent boards like Nolanet's, this means the relay tag simply has
+nothing to read — **`--no-flash` and `--token`/`--token-file` are the
+actual access controls** for such a deployment, and should be relied on
+as such rather than assuming the relay guard is doing any work.
+
+### 9.6 Deploying `serve` under systemd (Nolanet-style)
+
+`serve --print-service` renders the systemd unit for the exact `serve`
+invocation you'd otherwise run, to stdout, touching nothing on disk:
+
+```bash
+cd /path/to/project   # WorkingDirectory is baked in from this CWD
+mbdeploy serve --print-service --base-port 9000 --target-mcu nrf52833
+```
+
+`serve --install-service` writes that same unit to disk instead, and
+still exits without running the daemon — you run `daemon-reload`/
+`enable --now` yourself:
+
+```bash
+sudo mbdeploy serve --install-service --base-port 9000 --target-mcu nrf52833
+sudo systemctl daemon-reload
+sudo systemctl enable --now mbdeploy
+```
+
+**The system unit is the default.** `--install-service` with neither
+`--system` nor `--user` writes `/etc/systemd/system/mbdeploy.service`
+(`WantedBy=multi-user.target`) and requires root/sudo. This is a
+deliberate choice for a deployment like Nolanet's, not an arbitrary
+default: a systemd **`--user`** unit does **not** start at boot or
+survive logout on a host with the default `Linger=no` — which is
+Nolanet's actual state on every node — unless an operator separately
+runs `loginctl enable-linger <user>`. Pass `--user` only when that
+tradeoff is acceptable (e.g. a workstation you leave logged in), or
+combine it with the linger command:
+
+```bash
+mbdeploy serve --install-service --user
+loginctl enable-linger <user>   # required for the unit to survive logout/reboot
+```
+
+**A token is never written into `ExecStart`.**
+`--install-service --token SECRET` writes `SECRET` to a fresh,
+mode-`0600` file (`/etc/mbdeploy/token` for the system scope,
+`~/.config/mbdeploy/token` for `--user`) and bakes `--token-file
+<that path>` into the generated `ExecStart` line instead — never the
+literal secret, which `systemctl cat` would otherwise make
+world-readable to anyone on the box. `--token-file PATH`, naming a file
+you already created yourself, is used as given. `--print-service
+--token SECRET` is refused outright: `--print-service` touches no
+filesystem, so there is nowhere to put the secret; use `--token-file`
+with `--print-service`, or switch to `--install-service`.
+
+```bash
+sudo mbdeploy serve --install-service --token-file /etc/mbdeploy/token
+# or let --install-service create the file for you:
+sudo mbdeploy serve --install-service --token 'a-shared-secret'
+```
+
+**No new udev rule is needed on Raspberry Pi OS.** As §4.1 already
+covers for local use, Raspberry Pi OS ships
+`/lib/udev/rules.d/70-microbit.rules` (`TAG+="uaccess"` on the
+micro:bit's vendor id), and `plugdev` group membership is what actually
+grants headless USB access on top of that — there is nothing to add.
+Do **not** write a `MODE="0666"` rule for this; it is unnecessary and
+was verified as such during this project's Linux support work.
+
+**Group membership the service user needs**, since `serve` does both
+flashing (raw USB, via pyOCD) and serial relaying, unlike a purely
+read-only tool:
+
+```bash
+sudo usermod -aG plugdev,dialout <service-user>
+```
+
+— `plugdev` for pyOCD's raw USB access, `dialout` for the serial port:
+exactly the same two groups §4.1 already documents for local
+`deploy`/`connect`. Re-login (or reboot) for the new group membership
+to take effect before starting the service.
