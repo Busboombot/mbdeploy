@@ -80,6 +80,27 @@ def _make_args(
     )
 
 
+class _FakePyocdProcess:
+    """Stand-in for a ``subprocess.Popen`` instance representing pyocd.
+
+    Ticket 010 switched ``flash.py::flash_hex`` from a single blocking
+    ``subprocess.run()`` per pyocd invocation to a streaming
+    ``subprocess.Popen()`` (``flash.py::_run_streamed``), so every test
+    below that used to fake ``subprocess.run`` now fakes
+    ``subprocess.Popen`` instead -- pyocd is still never actually
+    invoked. ``_run_streamed`` only ever iterates ``.stdout`` for lines
+    and calls ``.wait()`` for the exit code, so that's all this fake
+    needs to provide.
+    """
+
+    def __init__(self, returncode: int, lines: tuple[str, ...] = ()):
+        self.returncode = returncode
+        self.stdout = iter(f"{line}\n" for line in lines)
+
+    def wait(self) -> int:
+        return self.returncode
+
+
 # ---------------------------------------------------------------------------
 # is_relay truth table
 # ---------------------------------------------------------------------------
@@ -303,9 +324,9 @@ class TestRelayGuard:
     def test_force_relay_passes_guard(self, monkeypatch, tmp_path):
         """--force-relay allows the deploy to proceed past the relay check.
 
-        The test patches flashable_probes to confirm connection but does NOT
-        patch subprocess.run (pyocd will fail or not be found), which is
-        acceptable — we only test the guard logic, not the flash itself.
+        The test patches flashable_probes to confirm connection and stubs
+        subprocess.Popen to a trivial always-succeeds fake, since this test
+        only exercises the guard logic, not the flash itself.
         """
         config = tmp_path / "devices.json"
         registry = self._registry_with_relay_only()
@@ -317,11 +338,11 @@ class TestRelayGuard:
             lambda: [{"uid": _RELAY_UID, "description": "relay"}],
         )
 
-        # Patch subprocess.run so pyocd flash/reset don't actually run
+        # Patch subprocess.Popen so pyocd flash/reset don't actually run
         import subprocess
         monkeypatch.setattr(
-            subprocess, "run",
-            lambda cmd, **kw: type("R", (), {"returncode": 0})(),
+            subprocess, "Popen",
+            lambda cmd, **kw: _FakePyocdProcess(0),
         )
 
         args = _make_args(target=_RELAY_UID, force_relay=True, config=str(config))
@@ -1036,8 +1057,8 @@ class TestAutoPick:
 
         import subprocess
         monkeypatch.setattr(
-            subprocess, "run",
-            lambda cmd, **kw: type("R", (), {"returncode": 0})(),
+            subprocess, "Popen",
+            lambda cmd, **kw: _FakePyocdProcess(0),
         )
 
         args = _make_args(target=None, config=str(config))
@@ -1096,10 +1117,10 @@ class TestDeployPortTarget:
 
         def fake_run(cmd, **kw):
             calls.append(cmd)
-            return type("R", (), {"returncode": 0})()
+            return _FakePyocdProcess(0)
 
         import subprocess
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
         return calls
 
     @staticmethod
@@ -1219,9 +1240,9 @@ class TestDeployPortTarget:
         calls: list[list[str]] = []
         import subprocess
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess, "Popen",
             lambda cmd, **kw: (calls.append(cmd),
-                               type("R", (), {"returncode": 0})())[1],
+                               _FakePyocdProcess(0))[1],
         )
 
         args = _make_args(
@@ -1342,10 +1363,10 @@ class TestMassEraseRecovery:
                 rc = 1 if state["flash"] == 1 else 0   # first flash fails
             else:
                 rc = 0                                  # erase / reset succeed
-            return type("R", (), {"returncode": rc})()
+            return _FakePyocdProcess(rc)
 
         import subprocess
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         args = _make_args(target=_DEVICE_UID, config=str(config))
         rc = _cmd_deploy(args)
@@ -1368,10 +1389,10 @@ class TestMassEraseRecovery:
                 rc = 5
             else:
                 rc = 0
-            return type("R", (), {"returncode": rc})()
+            return _FakePyocdProcess(rc)
 
         import subprocess
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         args = _make_args(target=_DEVICE_UID, config=str(config))
         rc = _cmd_deploy(args)
@@ -1388,10 +1409,10 @@ class TestMassEraseRecovery:
 
         def fake_run(cmd, **kw):
             calls.append(cmd)
-            return type("R", (), {"returncode": 0})()
+            return _FakePyocdProcess(0)
 
         import subprocess
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         args = _make_args(target=_DEVICE_UID, config=str(config))
         rc = _cmd_deploy(args)

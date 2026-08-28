@@ -687,6 +687,34 @@ recorded and flagged as blocking for team-lead/stakeholder decision
 rather than fixed here (Step 7) — tickets 007–009 do not proceed past
 that point until that decision is made.
 
+## Revision
+
+**Ticket 010 added post-acceptance (2026-08-27).** Ticket 009's real-hardware
+acceptance run found a genuine, reproducible defect (its Finding 2,
+escalated rather than silently patched, per its own recommendation not to
+close the arc's issue without a follow-up): `deploy --remote` exits 1 on
+a real ~450 KB hex even though the server-side flash actually succeeds,
+because `flash.py::flash_hex` runs pyocd via fully blocking
+`subprocess.run()` calls with no output streaming, so its `log` callback
+fires at only three fixed transition points and stays silent for the
+whole erase/program/verify duration — long enough for `remote.py`'s
+30s client-side read timeout (reset only on a `LOG` line) to expire.
+Reproduced 2/2 on real hardware; a tiny control hex within the 30s budget
+completes and exits 0, confirming this is a streaming/timeout defect, not
+a wire-protocol defect. This defeats the issue's own stated requirement
+to relay `LOG` lines as they arrive and breaks `deploy --remote`'s
+correctness on realistic firmware sizes — the sprint's headline client
+feature — so it must be fixed before this sprint (and the 3-sprint arc)
+closes. No architecture change: this is a bug fix confined to
+`flash.py`'s subprocess-invocation mechanics plus the tests that pin its
+behavior down, with no new module, no new cross-module dependency, and no
+data-model change — the sprint's Architecture section above (Substantial,
+Steps 1-7 plus self-review, APPROVE) is unaffected and is not revised.
+Ticket 010 traces to SUC-012 (deploy over the network) and SUC-014 (the
+arc's end-to-end acceptance payoff), the same use cases ticket 009 itself
+served, since it repairs the acceptance run's one blocking gap rather
+than introducing new behavior.
+
 ## Dependencies
 
 Depends on Sprint 002 — the daemon must exist and be installable before
@@ -719,6 +747,7 @@ Before tickets can be created, all of the following must be true:
 | 007 | Disk reclamation on `magni` and `hodr` | — |
 | 008 | Install mbdeploy + systemd system unit on all four Nolanet nodes | 006, 007 |
 | 009 | Full multi-node acceptance run from the Mac across the LAN | 008 |
+| 010 | Stream pyocd output through flash_hex so deploy --remote survives a real flash | — |
 
 Tickets execute serially in the order listed. 001 and 002 have no
 inter-ticket code dependency and could in principle run in either
@@ -740,7 +769,13 @@ hidapi crash reproduces, 008 does not proceed until team-lead/
 stakeholder decides how to handle it, since fixing `server.py`'s
 shutdown path is out of this sprint's stated Scope. 009 depends on 008
 — the acceptance script needs all four nodes actually running the
-daemon.
+daemon. 010 was added after 009 completed (see Revision above); it has
+no dependency on 009 as a ticket artifact — the code it fixes
+(`flash.py`) has existed since sprint 001 — but it is ordered last
+because 009's real-hardware run is what surfaced the defect, and 010's
+own acceptance criteria require re-running the same real-hardware
+deploy against `loki` with the fix deployed, which only makes sense
+once 009's baseline run already exists to compare against.
 
 ## Ticket Completion Notes
 

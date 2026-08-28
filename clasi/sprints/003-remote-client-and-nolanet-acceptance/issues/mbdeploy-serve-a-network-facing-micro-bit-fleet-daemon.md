@@ -23,6 +23,7 @@ tickets:
 - 003-007
 - 003-008
 - 003-009
+- 003-010
 ---
 
 # `mbdeploy serve` — a network-facing micro:bit fleet daemon

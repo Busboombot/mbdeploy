@@ -33,6 +33,37 @@ def _log(log: Callable[[str], None] | None, message: str) -> None:
         log(message)
 
 
+def _run_streamed(cmd: list[str], log: Callable[[str], None] | None) -> int:
+    """Run ``cmd``, relaying its combined stdout/stderr through ``_log``
+    line by line as it arrives, and return its exit code.
+
+    Uses ``subprocess.Popen`` rather than a single blocking
+    ``subprocess.run()`` specifically so pyocd's own progress output
+    (erase/program/verify lines -- previously visible only in the
+    daemon's inherited stdout / ``journalctl``) reaches the
+    caller-supplied ``log`` callback throughout the run, not only once
+    at exit. This is what lets ``server.py::serve_flash`` (whose ``log``
+    forwards every call to the network client as a ``LOG`` line) emit a
+    steady stream of progress for the whole duration of a real flash,
+    keeping ``remote.py``'s client-side read timeout meaningful instead
+    of expiring during a multi-second silent gap. See ticket 010 --
+    ``flash_hex``'s three fixed status messages alone left a real
+    ~450 KB flash silent from ``log``'s point of view for long enough to
+    trip that timeout even though the flash itself succeeded.
+
+    ``stderr=subprocess.STDOUT`` merges pyocd's stderr into the same
+    stream, since pyocd's progress output is not reliably confined to
+    one of the two and both matter equally to ``log``'s caller.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    assert proc.stdout is not None  # guaranteed by stdout=PIPE above
+    for line in proc.stdout:
+        _log(log, line.rstrip("\n"))
+    return proc.wait()
+
+
 def flash_hex(
     uid: str,
     hex_path: str,
@@ -47,6 +78,12 @@ def flash_hex(
     failure returns its own return code without retrying; a still-failing
     flash after mass erase returns its return code; success returns the
     ``reset`` return code.
+
+    Each pyocd subprocess's output is streamed through ``log`` as it
+    arrives (see :func:`_run_streamed`) rather than captured and
+    discarded, so a caller-supplied ``log`` sees progress throughout
+    each invocation, not just at the three fixed transition messages
+    below.
     """
     # --- flash (with mass-erase recovery for locked parts) ---
     flash_cmd = [
@@ -55,7 +92,7 @@ def flash_hex(
         "--uid", uid,
         hex_path,
     ]
-    rc = subprocess.run(flash_cmd).returncode
+    rc = _run_streamed(flash_cmd, log)
     if rc != 0:
         # A locked/protected nRF (APPROTECT set, or a protected SoftDevice
         # region at 0x0) rejects every flash-algorithm erase, so the flash
@@ -73,11 +110,11 @@ def flash_hex(
             "--uid", uid,
             "--mass",
         ]
-        erase_rc = subprocess.run(erase_cmd).returncode
+        erase_rc = _run_streamed(erase_cmd, log)
         if erase_rc != 0:
             _log(log, f"Error: mass erase failed (exit {erase_rc}).")
             return erase_rc
-        rc = subprocess.run(flash_cmd).returncode
+        rc = _run_streamed(flash_cmd, log)
         if rc != 0:
             _log(
                 log,
@@ -90,4 +127,4 @@ def flash_hex(
         "-t", target_mcu,
         "--uid", uid,
     ]
-    return subprocess.run(reset_cmd).returncode
+    return _run_streamed(reset_cmd, log)

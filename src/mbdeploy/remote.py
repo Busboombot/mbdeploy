@@ -390,9 +390,20 @@ def list_remote(timeout: float = 2.0) -> list[dict]:
 #: flash can legitimately pause between `LOG` lines during erase/verify,
 #: so this only has to catch a connection that has gone genuinely silent
 #: (or a test's scripted stall), not bound how long flashing itself may
-#: take. Matches `server.py`'s own `PAYLOAD_TIMEOUT` in magnitude and
-#: reasoning, applied to the client's side of the same exchange.
-_FLASH_READ_TIMEOUT = 30.0
+#: take.
+#:
+#: The real fix for a long flash going quiet under this timeout is
+#: ticket 010's streaming of pyocd's own output through `flash_hex`'s
+#: `log` callback (see `flash.py::_run_streamed`) -- that keeps
+#: `serve_flash` emitting `LOG` lines throughout the whole flash, which
+#: is what actually resets this timeout on a normal cadence. This value
+#: is bumped from the original 30s (which, per
+#: docs/acceptance/003-009-multi-node-acceptance.md Finding 2, a real
+#: ~450 KB flash's mass-erase-recovery path could still exceed even with
+#: streaming, on slow SWD hardware) to a more generous floor purely as
+#: defence in depth against an unusually slow or scripted-silent gap --
+#: not a substitute for the streaming fix above.
+_FLASH_READ_TIMEOUT = 90.0
 
 
 def _read_line(sock: socket.socket, max_len: int = 65536) -> str | None:

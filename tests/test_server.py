@@ -79,6 +79,31 @@ class FakeFlash:
         return self.rc
 
 
+class SlowFakeFlash(FakeFlash):
+    """Like `FakeFlash`, but sleeps for `delay` seconds before each
+    `log()` call, so a test reading the client socket can observe `LOG`
+    lines arriving spread out over real wall-clock time -- the way
+    ticket 010's streamed `flash_hex` actually behaves against real
+    pyocd output -- rather than all buffered until `flash_hex` returns.
+    """
+
+    def __init__(
+        self, rc: int = 0, log_lines: tuple[str, ...] = (), delay: float = 0.05
+    ) -> None:
+        super().__init__(rc=rc, log_lines=log_lines)
+        self.delay = delay
+
+    def __call__(self, uid, hex_path, target_mcu, log=None):
+        self.calls.append((uid, hex_path, target_mcu))
+        with open(hex_path, "rb") as f:
+            self.written_payload = f.read()
+        if log is not None:
+            for line in self.log_lines:
+                time.sleep(self.delay)
+                log(line)
+        return self.rc
+
+
 class FakeAdvertiser:
     """Stand-in for `mdns.Advertiser`: records register/unregister calls
     and hands back sequential integer handles. No real zeroconf, no real
@@ -531,6 +556,68 @@ class TestServeFlash:
             assert len(fake_flash.calls) == 1
             assert fake_flash.calls[0][0] == _UID
             assert fake_flash.written_payload == payload
+        finally:
+            client.close()
+            _close_listener(accept_loop, listener)
+
+    def test_flash_relays_time_spread_log_lines_individually(self, accept_loop, monkeypatch):
+        """Ticket 010 regression guard: `serve_flash` must relay each `LOG`
+        line to the client as `flash_hex` emits it, not buffer them until
+        `flash_hex` returns.
+
+        This is what keeps `remote.py`'s client-side per-line read timeout
+        meaningful during a real, multi-second flash -- see
+        docs/acceptance/003-009-multi-node-acceptance.md, Finding 2, where
+        `flash_hex`'s old three-fixed-message-only `log` calls left the
+        wire silent long enough to trip that timeout even though the flash
+        itself succeeded. `flash_hex` itself is monkeypatched here (as
+        everywhere else in this file) -- the property under test is
+        `serve_flash`'s relay, not `flash_hex`'s own streaming (covered at
+        the unit level in `tests/test_flash.py::TestStreamedOutputRelay`)
+        -- but `SlowFakeFlash` spaces its `log()` calls out over real time
+        the way a real streamed flash does, so this proves lines actually
+        arrive on the wire as they're produced.
+        """
+        lines_out = ("erasing", "programming", "verifying", "resetting")
+        fake_flash = SlowFakeFlash(rc=0, log_lines=lines_out, delay=0.05)
+        monkeypatch.setattr(server_mod, "flash_hex", fake_flash)
+        board = make_board()
+        listener = _listener_socket()
+        accept_loop.register(listener, functools.partial(server_mod.serve_flash, board))
+        client = _connect(listener)
+        client.settimeout(2.0)
+        try:
+            payload = b":10000000FF" * 4
+            client.sendall(f"FLASH {len(payload)}\n".encode())
+            assert _recv_line(client) == b"OK send"
+            client.sendall(payload)
+
+            received: list[tuple[float, bytes]] = []
+            while True:
+                line = _recv_line(client)
+                received.append((time.monotonic(), line))
+                if line.startswith(b"OK") or line.startswith(b"ERR"):
+                    break
+
+            log_lines = received[:-1]
+            assert [ln for _, ln in log_lines] == [
+                f"LOG {text}".encode() for text in lines_out
+            ]
+            assert received[-1][1] == b"OK flashed"
+
+            # Every line arrived individually (asserted above); now confirm
+            # they were genuinely spread across real time rather than all
+            # released back-to-back the instant flash_hex finally returned
+            # -- a regression to "serve_flash buffers until completion"
+            # would collapse this span to ~0 even though the lines/order
+            # assertion above would still pass.
+            span = log_lines[-1][0] - log_lines[0][0]
+            expected_min_span = fake_flash.delay * (len(lines_out) - 1) * 0.5
+            assert span > expected_min_span, (
+                f"LOG lines arrived within {span:.3f}s of each other; "
+                f"expected at least {expected_min_span:.3f}s if they were "
+                "relayed as flash_hex produced them rather than batched"
+            )
         finally:
             client.close()
             _close_listener(accept_loop, listener)

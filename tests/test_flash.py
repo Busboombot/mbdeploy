@@ -5,6 +5,17 @@ the same shared-subprocess-module monkeypatching technique as
 tests/test_devices.py::TestMassEraseRecovery, so this is the mechanical
 proof that the extraction from cli._cmd_deploy preserved pyocd's argv,
 messages, and return codes.
+
+Ticket 010 switched flash_hex's internals from a single blocking
+``subprocess.run()`` per pyocd invocation to a streaming
+``subprocess.Popen()`` (see flash.py::_run_streamed), so it could relay
+pyocd's output line by line through ``log`` instead of only at fixed
+transition points. Every fake here therefore patches ``subprocess.Popen``
+(not ``subprocess.run``) and returns a fake process object exposing just
+the two members ``_run_streamed`` touches: ``.stdout`` (an iterable of
+already-``\\n``-terminated lines) and ``.wait()`` (the exit code) --
+mirroring how a real ``Popen`` instance is used, without invoking pyocd
+for real.
 """
 
 from __future__ import annotations
@@ -23,8 +34,24 @@ _MCU = "nrf52833"
 _PYOCD = [sys.executable, "-m", "pyocd"]
 
 
-def _result(rc: int):
-    return type("R", (), {"returncode": rc})()
+class _FakeProcess:
+    """Stand-in for a ``subprocess.Popen`` instance.
+
+    ``flash.py::_run_streamed`` only ever iterates ``.stdout`` for lines
+    and calls ``.wait()`` for the exit code, so that's all this fake
+    needs to provide.
+    """
+
+    def __init__(self, returncode: int, lines: tuple[str, ...] = ()):
+        self.returncode = returncode
+        self.stdout = iter(f"{line}\n" for line in lines)
+
+    def wait(self) -> int:
+        return self.returncode
+
+
+def _result(rc: int, lines: tuple[str, ...] = ()):
+    return _FakeProcess(rc, lines)
 
 
 class TestArgvConstruction:
@@ -37,7 +64,7 @@ class TestArgvConstruction:
             calls.append(cmd)
             return _result(0)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
 
@@ -70,7 +97,7 @@ class TestArgvConstruction:
                 return _result(1 if state["flash"] == 1 else 0)
             return _result(0)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
 
@@ -102,7 +129,7 @@ class TestMassEraseRecovery:
                 rc = 0                                  # erase / reset succeed
             return _result(rc)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
 
@@ -124,7 +151,7 @@ class TestMassEraseRecovery:
                 rc = 0
             return _result(rc)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
 
@@ -140,7 +167,7 @@ class TestMassEraseRecovery:
             calls.append(cmd)
             return _result(0)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
 
@@ -159,7 +186,7 @@ class TestMassEraseRecovery:
                 rc = 0  # erase succeeds
             return _result(rc)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
 
@@ -179,7 +206,7 @@ class TestLogRouting:
                 return _result(5)
             return _result(0)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
 
@@ -198,7 +225,7 @@ class TestLogRouting:
                 return _result(5)
             return _result(0)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(
             _UID, _HEX_PATH, target_mcu=_MCU, log=messages.append
@@ -208,3 +235,68 @@ class TestLogRouting:
         assert any("flash failed" in m.lower() for m in messages)
         assert any("mass erase failed" in m.lower() for m in messages)
         assert capsys.readouterr().err == ""
+
+
+class TestStreamedOutputRelay:
+    """Regression guard for ticket 010.
+
+    Before ticket 010, ``flash_hex``'s ``log`` callback fired only at
+    three fixed transition messages -- never during the pyocd subprocess
+    itself -- because each pyocd invocation was a single blocking
+    ``subprocess.run()`` with no output capture at all. That silence is
+    exactly what let a real, multi-second flash's server-side success
+    race past ``deploy --remote``'s client-side read timeout (see
+    docs/acceptance/003-009-multi-node-acceptance.md, Finding 2).
+
+    This proves the fix directly at the unit level: a single
+    ``flash_hex`` call whose (faked) pyocd subprocess emits several
+    lines of progress output must route every one of them through
+    ``log`` individually -- not batched into one call, not dropped, not
+    limited to the three fixed status messages -- so a regression back
+    to "log only fires at fixed transitions" would fail this test
+    without needing real hardware.
+    """
+
+    def test_multiple_pyocd_lines_are_each_relayed_to_log(self, monkeypatch):
+        messages: list[str] = []
+        flash_progress = (
+            "Erasing...",
+            "Programming...",
+            "Erased 463872 bytes (114 sectors), "
+            "programmed 463872 bytes (114 pages) at 13.96 kB/s",
+        )
+        reset_progress = ("Resetting target.",)
+
+        def fake_run(cmd, **kw):
+            if "flash" in cmd:
+                return _result(0, flash_progress)
+            return _result(0, reset_progress)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(
+            _UID, _HEX_PATH, target_mcu=_MCU, log=messages.append
+        )
+
+        assert rc == 0
+        # Every streamed line arrived as its own log() call, in order,
+        # with no coalescing and none dropped.
+        assert messages == list(flash_progress) + list(reset_progress)
+
+    def test_multiple_pyocd_lines_each_print_to_stderr_when_log_is_none(
+        self, monkeypatch, capsys
+    ):
+        flash_progress = ("Erasing...", "Programming...", "Verifying...")
+
+        def fake_run(cmd, **kw):
+            if "flash" in cmd:
+                return _result(0, flash_progress)
+            return _result(0, ())
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+
+        assert rc == 0
+        err_lines = capsys.readouterr().err.splitlines()
+        assert err_lines == list(flash_progress)
