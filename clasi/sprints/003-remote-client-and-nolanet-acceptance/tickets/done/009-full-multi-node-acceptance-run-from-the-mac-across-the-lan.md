@@ -1,7 +1,7 @@
 ---
 id: 009
 title: Full multi-node acceptance run from the Mac across the LAN
-status: in-progress
+status: done
 use-cases:
 - SUC-010
 - SUC-011
