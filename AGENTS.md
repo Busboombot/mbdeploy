@@ -54,4 +54,19 @@ manually. Registration lives in `subsystems.yml` in
 cloned anonymously, so being outside the org does not block *pulling*.
 
 The complete publishing contract is at <https://robots.jointheleague.org/publishing/>.
+
+## Hardware safety rule — do not flash the NEZHA2 robots
+
+Standing instruction from the stakeholder. On the Robot Garage fleet, boards whose
+registry `role` is `NEZHA2` are working robots running firmware people depend on.
+
+- `connect` / `connect --remote` — **allowed** on any board, NEZHA2 included. It holds
+  DTR low, so opening the port does not reset the board.
+- `deploy` / `deploy --remote` — **never** target a `NEZHA2` board, and never pick one
+  as the test target when working on the flash path. Use a **silent** board (empty
+  `role`) instead; `mbdeploy list --remote` shows the ROLE column.
+
+The relay guard does **not** protect these: it only refuses roles naming a relay or
+bridge. Nothing in the tool prevents flashing a robot — this rule is the only thing
+that does.
 <!-- DOCS:END -->
