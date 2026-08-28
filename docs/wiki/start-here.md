@@ -1,6 +1,6 @@
 ---
-title: mbdeploy
-blurb: What mbdeploy is, where each part of the manual lives, and what is still missing.
+title: Start here
+blurb: What mbdeploy is, where the machines are documented, and what is still missing.
 order: 0
 updated: 2026-08-27
 tags: ["micro:bit", pyocd, deployment, mdns]

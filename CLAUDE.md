@@ -28,8 +28,12 @@ piece of work, not later**:
 1. **`docs/wiki/`** for anything about how the tool behaves. Each `docs/wiki/*.md`
    is one published page and needs `title:` and `blurb:` front matter; bump its
    `updated:` date. Files starting with `_` are not published.
-   Keep `docs/wiki/index.md` (`order: 0`) as the map — it links the pages and
-   carries the open-tasks / known-gaps list.
+   Keep `docs/wiki/start-here.md` (`order: 0`) as the map — it carries the
+   open-tasks / known-gaps list and the pointer to the internal wiki.
+   **Do not name it `index.md`.** The hub generates its own
+   `subsystems/<name>/index.md` landing page and overwrites any doc whose slug
+   is `index`, so the content silently disappears and the landing page links to
+   a 404. (Hub bug — the publishing contract still recommends `index.md`.)
 2. **The Robot Garage wiki page** for anything about the fleet itself — a node
    added or removed, a board moved, an install path or service change, a node
    whose daemon is down. Its "Current status" table goes stale fastest and is the
