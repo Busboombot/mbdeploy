@@ -706,7 +706,9 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     # --- flash (with mass-erase recovery for locked parts) ---
     from mbdeploy import flash as flash_mod
 
-    return flash_mod.flash_hex(uid, hex_path, target_mcu)
+    return flash_mod.flash_hex(
+        uid, hex_path, target_mcu, board_name=_device_label(entry)
+    )
 
 
 def _connect_port(target: str, registry: dict[str, dict]) -> str:

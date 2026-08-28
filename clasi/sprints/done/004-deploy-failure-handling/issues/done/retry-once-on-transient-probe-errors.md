@@ -1,5 +1,8 @@
 ---
-status: pending
+status: done
+sprint: '004'
+tickets:
+- 004-002
 ---
 
 # Retry the flash once on a transient probe error

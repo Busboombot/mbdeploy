@@ -1,5 +1,8 @@
 ---
-status: pending
+status: done
+sprint: '004'
+tickets:
+- 004-004
 ---
 
 # A failed deploy can leave a board unbootable without saying so

@@ -1,5 +1,10 @@
 ---
-status: pending
+status: done
+sprint: '004'
+tickets:
+- 004-001
+- 004-003
+- 004-005
 ---
 
 # Mass-erase recovery fires on failures it cannot fix, wiping working boards

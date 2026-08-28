@@ -676,6 +676,7 @@ def serve_flash(
                     tmp_path,
                     target_mcu,
                     log=lambda msg: _send_line(conn, f"LOG {msg}"),
+                    board_name=board.name,
                 )
             finally:
                 try:

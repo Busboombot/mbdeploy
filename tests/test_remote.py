@@ -1431,7 +1431,7 @@ class TestDeployOverNetworkAgainstRealServeFlash:
         hex_path = tmp_path / "MICROBIT.hex"
         hex_path.write_bytes(payload)
 
-        def fake_flash_hex(uid, hp, target_mcu, log=None):
+        def fake_flash_hex(uid, hp, target_mcu, log=None, board_name=None):
             with open(hp, "rb") as f:
                 written = f.read()
             assert written == payload
