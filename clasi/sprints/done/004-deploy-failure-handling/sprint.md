@@ -1,7 +1,7 @@
 ---
 id: '004'
 title: Deploy failure handling
-status: executing
+status: done
 branch: sprint/004-deploy-failure-handling
 use-cases: []
 issues:

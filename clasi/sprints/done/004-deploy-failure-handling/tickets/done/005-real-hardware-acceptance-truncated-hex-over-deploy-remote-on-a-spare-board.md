@@ -1,7 +1,7 @@
 ---
 id: '005'
 title: 'Real-hardware acceptance: truncated hex over deploy --remote on a spare board'
-status: in-progress
+status: done
 use-cases: []
 depends-on: []
 github-issue: ''
