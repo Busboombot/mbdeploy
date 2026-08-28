@@ -312,9 +312,10 @@ wheels = [
 
 [[package]]
 name = "mbdeploy"
-version = "0.20260827.3"
+version = "0.20260827.4"
 source = { editable = "." }
 dependencies = [
+    { name = "intelhex" },
     { name = "pyocd" },
     { name = "pyserial" },
     { name = "zeroconf" },
@@ -327,6 +328,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "intelhex", specifier = ">=2.3.0" },
     { name = "pyocd", specifier = ">=0.44.1" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },

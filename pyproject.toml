@@ -2,7 +2,7 @@
 name = "mbdeploy"
 version = "0.20260827.4"
 requires-python = ">=3.10"
-dependencies = ["pyocd>=0.44.1", "pyserial>=3.5", "zeroconf>=0.150.0"]
+dependencies = ["pyocd>=0.44.1", "pyserial>=3.5", "zeroconf>=0.150.0", "intelhex>=2.3.0"]
 
 [project.scripts]
 mbdeploy = "mbdeploy.cli:main"

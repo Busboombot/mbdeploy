@@ -11,6 +11,8 @@ import subprocess
 import sys
 from typing import Callable
 
+import intelhex
+
 from mbdeploy.devices import DEFAULT_MCU
 
 # Invoke pyocd through the running interpreter rather than as a bare PATH
@@ -31,6 +33,26 @@ def _log(log: Callable[[str], None] | None, message: str) -> None:
         print(message, file=sys.stderr)
     else:
         log(message)
+
+
+def _validate_hex(hex_path: str) -> str | None:
+    """Parse ``hex_path`` with ``intelhex`` before any pyocd invocation.
+
+    This is a pre-flight check, not a flash attempt: it never touches a
+    board, only the file on disk. Returns ``None`` if ``hex_path`` parses
+    as a valid Intel HEX file, or a short, human-readable message
+    otherwise -- covering a missing/unreadable file (``OSError``, e.g.
+    ``FileNotFoundError``/``PermissionError``) and a malformed one
+    (``intelhex.IntelHexError`` and its subclasses, e.g. a bad record or
+    checksum) without leaking either exception's raw traceback.
+    """
+    try:
+        intelhex.IntelHex().loadhex(hex_path)
+    except OSError as exc:
+        return f"cannot read hex file {hex_path!r}: {exc}"
+    except intelhex.IntelHexError as exc:
+        return f"invalid hex file {hex_path!r}: {exc}"
+    return None
 
 
 def _run_streamed(cmd: list[str], log: Callable[[str], None] | None) -> int:
@@ -84,7 +106,18 @@ def flash_hex(
     discarded, so a caller-supplied ``log`` sees progress throughout
     each invocation, not just at the three fixed transition messages
     below.
+
+    Before any of that: ``hex_path`` is validated with ``intelhex``
+    (:func:`_validate_hex`). A missing, unreadable, or malformed hex file
+    fails here, with a clear message routed through ``log``, before any
+    ``pyocd`` subprocess is constructed or run -- so an operator-side file
+    problem never reaches the board at all.
     """
+    hex_error = _validate_hex(hex_path)
+    if hex_error is not None:
+        _log(log, f"Error: {hex_error}")
+        return 1
+
     # --- flash (with mass-erase recovery for locked parts) ---
     flash_cmd = [
         *_PYOCD, "flash",

@@ -16,6 +16,12 @@ the two members ``_run_streamed`` touches: ``.stdout`` (an iterable of
 already-``\\n``-terminated lines) and ``.wait()`` (the exit code) --
 mirroring how a real ``Popen`` instance is used, without invoking pyocd
 for real.
+
+Ticket 001 added a pre-flight ``intelhex`` validation step ahead of any
+pyocd invocation, so every test below that expects the faked
+``subprocess.Popen`` step to be reached now uses the ``valid_hex``
+fixture (a real, on-disk, minimal valid Intel HEX file) instead of the
+literal, nonexistent ``_HEX_PATH`` constant.
 """
 
 from __future__ import annotations
@@ -32,6 +38,24 @@ _HEX_PATH = "MICROBIT.hex"
 _MCU = "nrf52833"
 
 _PYOCD = [sys.executable, "-m", "pyocd"]
+
+#: A minimal, complete, valid Intel HEX file: just the EOF record.
+_VALID_HEX_CONTENT = ":00000001FF\n"
+
+
+@pytest.fixture
+def valid_hex(tmp_path) -> str:
+    """A real, on-disk, valid Intel HEX file's path.
+
+    ``flash_hex`` now validates ``hex_path`` with ``intelhex`` before ever
+    invoking pyocd (ticket 001), so every test below that expects the
+    faked ``subprocess.Popen`` step to be reached needs a real file --
+    the module-level ``_HEX_PATH`` literal ("MICROBIT.hex") does not
+    exist on disk and would now fail validation before reaching the fake.
+    """
+    path = tmp_path / "valid.hex"
+    path.write_text(_VALID_HEX_CONTENT)
+    return str(path)
 
 
 class _FakeProcess:
@@ -57,7 +81,7 @@ def _result(rc: int, lines: tuple[str, ...] = ()):
 class TestArgvConstruction:
     """A successful first flash should invoke exactly flash + reset."""
 
-    def test_flash_and_reset_argv(self, monkeypatch):
+    def test_flash_and_reset_argv(self, monkeypatch, valid_hex):
         calls: list[list[str]] = []
 
         def fake_run(cmd, **kw):
@@ -66,7 +90,7 @@ class TestArgvConstruction:
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
         assert rc == 0
         assert len(calls) == 2
@@ -76,7 +100,7 @@ class TestArgvConstruction:
             *_PYOCD, "flash",
             "-t", _MCU,
             "--uid", _UID,
-            _HEX_PATH,
+            valid_hex,
         ]
         assert reset_cmd == [
             *_PYOCD, "reset",
@@ -86,7 +110,7 @@ class TestArgvConstruction:
         # No mass erase on a clean first flash.
         assert not any("erase" in c for c in calls)
 
-    def test_erase_argv_on_recovery(self, monkeypatch):
+    def test_erase_argv_on_recovery(self, monkeypatch, valid_hex):
         calls: list[list[str]] = []
         state = {"flash": 0}
 
@@ -99,7 +123,7 @@ class TestArgvConstruction:
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
         assert rc == 0
         erase_calls = [c for c in calls if "erase" in c]
@@ -115,7 +139,7 @@ class TestArgvConstruction:
 class TestMassEraseRecovery:
     """Direct-call equivalents of tests/test_devices.py::TestMassEraseRecovery."""
 
-    def test_flash_retries_after_mass_erase(self, monkeypatch):
+    def test_flash_retries_after_mass_erase(self, monkeypatch, valid_hex):
         """First flash fails, mass erase succeeds, second flash + reset succeed."""
         calls: list[list[str]] = []
         state = {"flash": 0}
@@ -131,13 +155,13 @@ class TestMassEraseRecovery:
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
         assert rc == 0
         assert state["flash"] == 2                      # flashed twice
         assert any("erase" in c and "--mass" in c for c in calls)
 
-    def test_mass_erase_failure_aborts_without_retry(self, monkeypatch, capsys):
+    def test_mass_erase_failure_aborts_without_retry(self, monkeypatch, capsys, valid_hex):
         """If the mass erase itself fails, flash_hex aborts and does not re-flash."""
         state = {"flash": 0}
 
@@ -153,13 +177,13 @@ class TestMassEraseRecovery:
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
         assert rc == 5
         assert state["flash"] == 1                      # no retry after erase failure
         assert "mass erase failed" in capsys.readouterr().err.lower()
 
-    def test_successful_flash_skips_mass_erase(self, monkeypatch):
+    def test_successful_flash_skips_mass_erase(self, monkeypatch, valid_hex):
         """The normal path never mass-erases when the first flash succeeds."""
         calls: list[list[str]] = []
 
@@ -169,12 +193,12 @@ class TestMassEraseRecovery:
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
         assert rc == 0
         assert not any("erase" in c for c in calls)
 
-    def test_flash_still_failing_after_mass_erase_returns_flash_rc(self, monkeypatch, capsys):
+    def test_flash_still_failing_after_mass_erase_returns_flash_rc(self, monkeypatch, capsys, valid_hex):
         """Mass erase succeeds but the retried flash still fails: return its rc."""
         state = {"flash": 0}
 
@@ -188,7 +212,7 @@ class TestMassEraseRecovery:
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
         assert rc == 7
         assert state["flash"] == 2
@@ -198,7 +222,7 @@ class TestMassEraseRecovery:
 class TestLogRouting:
     """log=None must print to stderr; a supplied log callable must intercept it."""
 
-    def test_log_none_prints_to_stderr(self, monkeypatch, capsys):
+    def test_log_none_prints_to_stderr(self, monkeypatch, capsys, valid_hex):
         def fake_run(cmd, **kw):
             if "flash" in cmd:
                 return _result(1)
@@ -208,14 +232,14 @@ class TestLogRouting:
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
         assert rc == 5
         err = capsys.readouterr().err
         assert "flash failed" in err.lower()
         assert "mass erase failed" in err.lower()
 
-    def test_supplied_log_receives_messages_and_stderr_stays_clean(self, monkeypatch, capsys):
+    def test_supplied_log_receives_messages_and_stderr_stays_clean(self, monkeypatch, capsys, valid_hex):
         messages: list[str] = []
 
         def fake_run(cmd, **kw):
@@ -228,7 +252,7 @@ class TestLogRouting:
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(
-            _UID, _HEX_PATH, target_mcu=_MCU, log=messages.append
+            _UID, valid_hex, target_mcu=_MCU, log=messages.append
         )
 
         assert rc == 5
@@ -257,7 +281,7 @@ class TestStreamedOutputRelay:
     without needing real hardware.
     """
 
-    def test_multiple_pyocd_lines_are_each_relayed_to_log(self, monkeypatch):
+    def test_multiple_pyocd_lines_are_each_relayed_to_log(self, monkeypatch, valid_hex):
         messages: list[str] = []
         flash_progress = (
             "Erasing...",
@@ -275,7 +299,7 @@ class TestStreamedOutputRelay:
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(
-            _UID, _HEX_PATH, target_mcu=_MCU, log=messages.append
+            _UID, valid_hex, target_mcu=_MCU, log=messages.append
         )
 
         assert rc == 0
@@ -284,7 +308,7 @@ class TestStreamedOutputRelay:
         assert messages == list(flash_progress) + list(reset_progress)
 
     def test_multiple_pyocd_lines_each_print_to_stderr_when_log_is_none(
-        self, monkeypatch, capsys
+        self, monkeypatch, capsys, valid_hex
     ):
         flash_progress = ("Erasing...", "Programming...", "Verifying...")
 
@@ -295,8 +319,57 @@ class TestStreamedOutputRelay:
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        rc = flash_mod.flash_hex(_UID, _HEX_PATH, target_mcu=_MCU)
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
         assert rc == 0
         err_lines = capsys.readouterr().err.splitlines()
         assert err_lines == list(flash_progress)
+
+
+class TestHexValidation:
+    """Ticket 001: a bad hex file must never reach pyocd at all."""
+
+    def test_malformed_hex_rejected_with_zero_subprocess_calls(
+        self, monkeypatch, tmp_path
+    ):
+        bad_path = tmp_path / "bad.hex"
+        bad_path.write_text("this is not a valid hex file\n")
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        messages: list[str] = []
+        rc = flash_mod.flash_hex(
+            _UID, str(bad_path), target_mcu=_MCU, log=messages.append
+        )
+
+        assert rc != 0
+        assert calls == []
+        assert any("hex" in m.lower() for m in messages)
+
+    def test_missing_hex_rejected_with_zero_subprocess_calls(
+        self, monkeypatch, tmp_path
+    ):
+        missing_path = tmp_path / "does-not-exist.hex"
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        messages: list[str] = []
+        rc = flash_mod.flash_hex(
+            _UID, str(missing_path), target_mcu=_MCU, log=messages.append
+        )
+
+        assert rc != 0
+        assert calls == []
+        assert any("hex" in m.lower() for m in messages)

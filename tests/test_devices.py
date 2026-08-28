@@ -80,6 +80,20 @@ def _make_args(
     )
 
 
+@pytest.fixture
+def valid_hex_path(tmp_path) -> str:
+    """A real, on-disk, valid Intel HEX file's path.
+
+    ``flash_hex`` validates ``hex_path`` with ``intelhex`` before ever
+    invoking pyocd (ticket 001), so any ``_cmd_deploy`` test that expects
+    the (faked) pyocd subprocess to run needs a real file on disk -- the
+    default ``_DEFAULT_HEX`` ("MICROBIT.hex") does not exist here.
+    """
+    path = tmp_path / "valid.hex"
+    path.write_text(":00000001FF\n")
+    return str(path)
+
+
 class _FakePyocdProcess:
     """Stand-in for a ``subprocess.Popen`` instance representing pyocd.
 
@@ -321,7 +335,7 @@ class TestRelayGuard:
         rc = _cmd_deploy(args)
         assert rc != 0
 
-    def test_force_relay_passes_guard(self, monkeypatch, tmp_path):
+    def test_force_relay_passes_guard(self, monkeypatch, tmp_path, valid_hex_path):
         """--force-relay allows the deploy to proceed past the relay check.
 
         The test patches flashable_probes to confirm connection and stubs
@@ -345,7 +359,10 @@ class TestRelayGuard:
             lambda cmd, **kw: _FakePyocdProcess(0),
         )
 
-        args = _make_args(target=_RELAY_UID, force_relay=True, config=str(config))
+        args = _make_args(
+            target=_RELAY_UID, force_relay=True, config=str(config),
+            hex_path=valid_hex_path,
+        )
         rc = _cmd_deploy(args)
         # Guard passed; result depends on mock subprocess — we accept 0 here
         assert rc == 0
@@ -1040,7 +1057,7 @@ class TestProbeAllOnlyUids:
 class TestAutoPick:
     """Tests the 'no target' auto-pick logic."""
 
-    def test_unique_non_relay_is_auto_picked(self, monkeypatch, tmp_path):
+    def test_unique_non_relay_is_auto_picked(self, monkeypatch, tmp_path, valid_hex_path):
         """When exactly one non-relay device exists, it is auto-picked."""
         config = tmp_path / "devices.json"
         registry = {
@@ -1061,7 +1078,7 @@ class TestAutoPick:
             lambda cmd, **kw: _FakePyocdProcess(0),
         )
 
-        args = _make_args(target=None, config=str(config))
+        args = _make_args(target=None, config=str(config), hex_path=valid_hex_path)
         rc = _cmd_deploy(args)
         assert rc == 0
 
@@ -1131,7 +1148,7 @@ class TestDeployPortTarget:
         return None
 
     def test_stale_registry_port_does_not_pick_the_board(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, valid_hex_path
     ):
         """The core regression guard: the ports in the registry are swapped.
 
@@ -1150,7 +1167,8 @@ class TestDeployPortTarget:
         calls = self._setup(monkeypatch, registry, live_ports)
 
         args = _make_args(
-            target="/dev/cu.device1", config=str(tmp_path / "devices.json")
+            target="/dev/cu.device1", config=str(tmp_path / "devices.json"),
+            hex_path=valid_hex_path,
         )
         rc = _cmd_deploy(args)
 
@@ -1284,26 +1302,35 @@ class TestDeployPortTarget:
         }
         return registry, self._setup(monkeypatch, registry, live_ports)
 
-    def test_enum_resolution_is_unchanged(self, monkeypatch, tmp_path):
+    def test_enum_resolution_is_unchanged(self, monkeypatch, tmp_path, valid_hex_path):
         _registry, calls = self._stale_fleet(monkeypatch)
         rc = _cmd_deploy(
-            _make_args(target="2", config=str(tmp_path / "devices.json"))
+            _make_args(
+                target="2", config=str(tmp_path / "devices.json"),
+                hex_path=valid_hex_path,
+            )
         )
         assert rc == 0
         assert self._flashed_uid(calls) == _DEVICE_UID
 
-    def test_uid_resolution_is_unchanged(self, monkeypatch, tmp_path):
+    def test_uid_resolution_is_unchanged(self, monkeypatch, tmp_path, valid_hex_path):
         _registry, calls = self._stale_fleet(monkeypatch)
         rc = _cmd_deploy(
-            _make_args(target=_DEVICE2_UID, config=str(tmp_path / "devices.json"))
+            _make_args(
+                target=_DEVICE2_UID, config=str(tmp_path / "devices.json"),
+                hex_path=valid_hex_path,
+            )
         )
         assert rc == 0
         assert self._flashed_uid(calls) == _DEVICE2_UID
 
-    def test_name_resolution_is_unchanged(self, monkeypatch, tmp_path):
+    def test_name_resolution_is_unchanged(self, monkeypatch, tmp_path, valid_hex_path):
         _registry, calls = self._stale_fleet(monkeypatch)
         rc = _cmd_deploy(
-            _make_args(target="alpha-main", config=str(tmp_path / "devices.json"))
+            _make_args(
+                target="alpha-main", config=str(tmp_path / "devices.json"),
+                hex_path=valid_hex_path,
+            )
         )
         assert rc == 0
         assert self._flashed_uid(calls) == _DEVICE2_UID
@@ -1349,7 +1376,7 @@ class TestMassEraseRecovery:
         )
         return config
 
-    def test_flash_retries_after_mass_erase(self, monkeypatch, tmp_path):
+    def test_flash_retries_after_mass_erase(self, monkeypatch, tmp_path, valid_hex_path):
         """First flash fails, mass erase succeeds, second flash + reset succeed."""
         config = self._connect_one_device(monkeypatch, tmp_path)
 
@@ -1368,14 +1395,14 @@ class TestMassEraseRecovery:
         import subprocess
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        args = _make_args(target=_DEVICE_UID, config=str(config))
+        args = _make_args(target=_DEVICE_UID, config=str(config), hex_path=valid_hex_path)
         rc = _cmd_deploy(args)
 
         assert rc == 0
         assert state["flash"] == 2                      # flashed twice
         assert any("erase" in c and "--mass" in c for c in calls)
 
-    def test_mass_erase_failure_aborts_without_retry(self, monkeypatch, tmp_path, capsys):
+    def test_mass_erase_failure_aborts_without_retry(self, monkeypatch, tmp_path, capsys, valid_hex_path):
         """If the mass erase itself fails, deploy aborts and does not re-flash."""
         config = self._connect_one_device(monkeypatch, tmp_path)
 
@@ -1394,14 +1421,14 @@ class TestMassEraseRecovery:
         import subprocess
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        args = _make_args(target=_DEVICE_UID, config=str(config))
+        args = _make_args(target=_DEVICE_UID, config=str(config), hex_path=valid_hex_path)
         rc = _cmd_deploy(args)
 
         assert rc == 5
         assert state["flash"] == 1                      # no retry after erase failure
         assert "mass erase failed" in capsys.readouterr().err.lower()
 
-    def test_successful_flash_skips_mass_erase(self, monkeypatch, tmp_path):
+    def test_successful_flash_skips_mass_erase(self, monkeypatch, tmp_path, valid_hex_path):
         """The normal path never mass-erases when the first flash succeeds."""
         config = self._connect_one_device(monkeypatch, tmp_path)
 
@@ -1414,7 +1441,7 @@ class TestMassEraseRecovery:
         import subprocess
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-        args = _make_args(target=_DEVICE_UID, config=str(config))
+        args = _make_args(target=_DEVICE_UID, config=str(config), hex_path=valid_hex_path)
         rc = _cmd_deploy(args)
 
         assert rc == 0
