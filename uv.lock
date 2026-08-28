@@ -312,7 +312,7 @@ wheels = [
 
 [[package]]
 name = "mbdeploy"
-version = "0.20260827.4"
+version = "0.20260827.5"
 source = { editable = "." }
 dependencies = [
     { name = "intelhex" },

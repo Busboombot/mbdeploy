@@ -277,3 +277,77 @@ One acceptance criterion is genuinely not provable without a spare board:
 Tracked as `clasi/issues/reconfirm-the-good-flash-path-on-hardware-after-sprint-004.md`.
 It needs a non-robot board plugged into any fleet node — no code change first; the fix
 is already deployed and running on `loki` (`0.20260827.4`).
+
+---
+
+## Hardware acceptance on `vevav` (2026-08-28)
+
+Run from a laptop across the LAN against `vevav` on `meili` (192.168.1.150), a
+non-robot board (empty ROLE), designated for testing by the stakeholder.
+
+**Baseline.** `vevav` was not silent — it streamed continuous unprompted `x:0`/`y:0`
+telemetry, so it carried working firmware. `connect --remote vevav "HELLO"` exited 0.
+
+### 1. The headline regression — PASS
+
+```
+$ mbdeploy deploy --remote vevav --hex /tmp/bad.hex     # 400,000 bytes of a 637,120-byte file
+Error: invalid hex file '/tmp/mbdeploy-flash-97nypgjj.hex': Hex file contains invalid record at line 9093
+Error: flash failed (exit 1)
+exit=1
+```
+
+The daemon validated the streamed payload and refused it. `journalctl -u mbdeploy`
+for the window: **no entries at all** — no pyocd subprocess, no erase. `vevav` was
+still streaming telemetry immediately afterwards, unharmed.
+
+Before sprint 004 this input mass-erased the board.
+
+### 2. Mass-erase gating and the blank-board message — both correct
+
+The first valid flash hit a genuine locked-device failure and behaved exactly as
+designed:
+
+```
+flash erase sector failure (address 0x00000000; result code 0x67)
+flash failed — attempting CTRL-AP mass erase to recover a locked device, then retrying.
+Mass erasing device... / Mass erase complete
+Error reading AP#0 IDR: Timeout reading from probe 9906...163f
+Error: flash still failed after mass erase (exit 1) — vevav WAS ERASED AND NOW HAS
+NO FIRMWARE. It will not run until it is successfully reflashed.
+```
+
+`0x67` is a real locked signature, so firing the erase was right; and the new
+message named the board and stated its condition accurately — the operator no
+longer has to infer it.
+
+### 3. A gap this exposed
+
+The post-erase reflash failed on `Timeout reading from probe`, a **transient**
+signature sprint 004 already recognises — but the retry was implemented for the
+first flash attempt only. Re-running the identical command immediately restored the
+board. Filed as
+`clasi/issues/post-erase-reflash-is-not-retried-on-a-transient-failure.md`.
+
+### 4. Good path — PASS
+
+```
+$ mbdeploy deploy --remote vevav --hex micropython-microbit-v2.1.2.hex   # 1,239,726 bytes
+Erased 463872 bytes (114 sectors), programmed 463872 bytes (114 pages) at 13.69 kB/s
+```
+
+Continuous `LOG` progress throughout, exit 0. Verified live over the network
+afterwards — the MicroPython REPL answers:
+
+```
+>>> print(6*7)
+42
+```
+
+**Note:** an intermediate attempt used `microbit-micropython-v1.0.1.hex`, which is
+**micro:bit V1** firmware (nRF51). It wrote successfully to a V2 board and then would
+not run — a reminder that mbdeploy does not and cannot check that a hex matches the
+target's silicon. Corrected by flashing the V2 build.
+
+`vevav` now runs MicroPython v2.1.2. Its previous telemetry firmware was replaced by
+this test.
