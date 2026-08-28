@@ -55,9 +55,47 @@ def _validate_hex(hex_path: str) -> str | None:
     return None
 
 
-def _run_streamed(cmd: list[str], log: Callable[[str], None] | None) -> int:
+# ---------------------------------------------------------------------------
+# Failure-signature matching
+#
+# These are the ONE named, documented place pyocd's failure wording is
+# matched against (per sprint 004's hazard about string-matching
+# brittleness): narrow substrings drawn from the concrete field reports
+# behind this sprint, not a general parser of pyocd's output. Anything
+# that matches neither list is "not recoverable" -- flash_hex must never
+# treat an unrecognized failure as a reason to mass-erase (see
+# flash_hex's Design Rationale in sprint.md: an unrecognized failure that
+# *was* actually a lock costs one manual `pyocd erase --mass`; treating
+# an unrecognized failure as locked and erasing anyway costs a board's
+# firmware -- the asymmetry is not close).
+# ---------------------------------------------------------------------------
+
+#: A flaky USB/probe/communication problem, not a property of the board's
+#: flash contents or protection state -- worth exactly one blind retry,
+#: since the same flash often succeeds outright the second time.
+_TRANSIENT_SIGNATURES = (
+    "timeout reading from probe",
+    "probe timeout",
+    "communication failure",
+    "communication fault",
+    "transfer fault",
+    "transfer error",
+    "dapaccess",
+)
+
+
+def _looks_transient(output: str) -> bool:
+    """True if ``output`` (pyocd's captured stdout/stderr) names a
+    transient probe/communication problem worth one blind retry."""
+    lowered = output.lower()
+    return any(sig in lowered for sig in _TRANSIENT_SIGNATURES)
+
+
+def _run_streamed(
+    cmd: list[str], log: Callable[[str], None] | None
+) -> tuple[int, str]:
     """Run ``cmd``, relaying its combined stdout/stderr through ``_log``
-    line by line as it arrives, and return its exit code.
+    line by line as it arrives, and return ``(exit_code, output_text)``.
 
     Uses ``subprocess.Popen`` rather than a single blocking
     ``subprocess.run()`` specifically so pyocd's own progress output
@@ -73,6 +111,12 @@ def _run_streamed(cmd: list[str], log: Callable[[str], None] | None) -> int:
     ~450 KB flash silent from ``log``'s point of view for long enough to
     trip that timeout even though the flash itself succeeded.
 
+    ``output_text`` accumulates the exact same lines already relayed to
+    ``log`` (newline-joined), as a side buffer for signature matching
+    (:func:`_looks_transient`/:func:`_looks_locked`) -- it does not
+    change what is streamed or when, and it is not batching or deferring
+    anything: every line still reaches ``log`` the instant it arrives.
+
     ``stderr=subprocess.STDOUT`` merges pyocd's stderr into the same
     stream, since pyocd's progress output is not reliably confined to
     one of the two and both matter equally to ``log``'s caller.
@@ -81,9 +125,12 @@ def _run_streamed(cmd: list[str], log: Callable[[str], None] | None) -> int:
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     assert proc.stdout is not None  # guaranteed by stdout=PIPE above
+    lines: list[str] = []
     for line in proc.stdout:
-        _log(log, line.rstrip("\n"))
-    return proc.wait()
+        stripped = line.rstrip("\n")
+        lines.append(stripped)
+        _log(log, stripped)
+    return proc.wait(), "\n".join(lines)
 
 
 def flash_hex(
@@ -112,6 +159,12 @@ def flash_hex(
     fails here, with a clear message routed through ``log``, before any
     ``pyocd`` subprocess is constructed or run -- so an operator-side file
     problem never reaches the board at all.
+
+    A first flash failure whose output looks transient (a probe timeout,
+    a communication/transfer fault, or a ``DAPAccess`` error --
+    :func:`_looks_transient`) is retried exactly once, logged visibly,
+    before anything else is decided -- most flaky-USB failures simply
+    succeed the second time with no change to the board's state at all.
     """
     hex_error = _validate_hex(hex_path)
     if hex_error is not None:
@@ -125,7 +178,15 @@ def flash_hex(
         "--uid", uid,
         hex_path,
     ]
-    rc = _run_streamed(flash_cmd, log)
+    rc, output = _run_streamed(flash_cmd, log)
+    if rc != 0 and _looks_transient(output):
+        _log(
+            log,
+            "flash failed with a transient-looking probe/communication "
+            "error — retrying once before any mass-erase decision.",
+        )
+        rc, output = _run_streamed(flash_cmd, log)
+
     if rc != 0:
         # A locked/protected nRF (APPROTECT set, or a protected SoftDevice
         # region at 0x0) rejects every flash-algorithm erase, so the flash
@@ -143,11 +204,11 @@ def flash_hex(
             "--uid", uid,
             "--mass",
         ]
-        erase_rc = _run_streamed(erase_cmd, log)
+        erase_rc, _erase_output = _run_streamed(erase_cmd, log)
         if erase_rc != 0:
             _log(log, f"Error: mass erase failed (exit {erase_rc}).")
             return erase_rc
-        rc = _run_streamed(flash_cmd, log)
+        rc, output = _run_streamed(flash_cmd, log)
         if rc != 0:
             _log(
                 log,
@@ -160,4 +221,5 @@ def flash_hex(
         "-t", target_mcu,
         "--uid", uid,
     ]
-    return _run_streamed(reset_cmd, log)
+    reset_rc, _reset_output = _run_streamed(reset_cmd, log)
+    return reset_rc

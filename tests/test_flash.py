@@ -326,6 +326,90 @@ class TestStreamedOutputRelay:
         assert err_lines == list(flash_progress)
 
 
+class TestTransientRetry:
+    """Ticket 002: a transient probe/communication signature on the first
+    flash gets exactly one blind retry, logged visibly, before anything
+    else (including a mass-erase decision) is considered.
+    """
+
+    def test_transient_signature_retries_once_and_succeeds(
+        self, monkeypatch, valid_hex
+    ):
+        """A probe timeout on the first flash retries once and succeeds,
+        with no mass erase anywhere in the invocation sequence."""
+        calls: list[list[str]] = []
+        state = {"flash": 0}
+        messages: list[str] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "flash" in cmd:
+                state["flash"] += 1
+                if state["flash"] == 1:
+                    return _result(1, ("Timeout reading from probe.",))
+                return _result(0)
+            return _result(0)  # reset
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU, log=messages.append
+        )
+
+        assert rc == 0
+        assert state["flash"] == 2
+        assert not any("erase" in c for c in calls)
+        assert any(
+            "retry" in m.lower() or "retrying" in m.lower() for m in messages
+        )
+
+    def test_two_consecutive_transient_failures_retries_only_once(
+        self, monkeypatch, valid_hex
+    ):
+        """Two consecutive transient failures give up after the one
+        retry -- not a loop -- and proceed to the (existing) post-flash
+        handling exactly once more."""
+        state = {"flash": 0}
+
+        def fake_run(cmd, **kw):
+            if "flash" in cmd:
+                state["flash"] += 1
+                return _result(1, ("DAPAccess Error: some transient fault",))
+            if "erase" in cmd:
+                # Erase itself fails here purely to short-circuit the
+                # sequence right after the retry, so this test can assert
+                # "exactly one retry" without depending on ticket 003's
+                # (not-yet-landed) locked-signature gate.
+                return _result(9)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
+
+        assert rc == 9
+        assert state["flash"] == 2                      # exactly one retry
+
+    def test_non_transient_failure_is_not_retried(self, monkeypatch, valid_hex):
+        """A failure with no transient signature is not retried at all."""
+        state = {"flash": 0}
+
+        def fake_run(cmd, **kw):
+            if "flash" in cmd:
+                state["flash"] += 1
+                return _result(1, ("some unrelated pyocd error",))
+            if "erase" in cmd:
+                return _result(9)  # short-circuit, see test above
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
+
+        assert rc == 9
+        assert state["flash"] == 1                      # no retry at all
+
+
 class TestHexValidation:
     """Ticket 001: a bad hex file must never reach pyocd at all."""
 
