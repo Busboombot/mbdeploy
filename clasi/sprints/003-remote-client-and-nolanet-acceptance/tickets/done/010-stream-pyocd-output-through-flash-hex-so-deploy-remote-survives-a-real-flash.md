@@ -1,7 +1,7 @@
 ---
 id: '010'
 title: Stream pyocd output through flash_hex so deploy --remote survives a real flash
-status: in-progress
+status: done
 use-cases:
 - SUC-012
 - SUC-014
