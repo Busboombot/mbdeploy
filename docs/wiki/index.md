@@ -3,7 +3,7 @@ title: mbdeploy
 blurb: What mbdeploy is, where each part of the manual lives, and what is still missing.
 order: 0
 updated: 2026-08-27
-tags: [micro:bit, pyocd, deployment, mdns]
+tags: ["micro:bit", pyocd, deployment, mdns]
 ---
 
 # mbdeploy

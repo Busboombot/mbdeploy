@@ -114,6 +114,7 @@ side that knows the board's `role`.
 | `--fast` | `list --remote` | `list --remote` never reads a board name over SWD — names come from mDNS, not a debug probe — so there is no read to skip. |
 | `--target-mcu MCU` | `list --remote` | Same reason: it only ever fed that SWD read. |
 | `--target-mcu MCU` | `deploy --remote` | Accepted for symmetry with the local path, but never sent on the wire. The daemon flashes with its own `--target-mcu`. |
+| `--config PATH` | all three | No local registry is consulted in `--remote` mode; identities come from mDNS. |
 
 ## Rejected combinations
 

@@ -87,8 +87,8 @@ by zeroconf's own `name (2)` rename.
 
 | Service type | Purpose | Protocol |
 |---|---|---|
-| `_mbserial._tcp.local.` | Raw serial pass-through | [below](#_mbserial_tcp-the-serial-relay) |
-| `_mbflash._tcp.local.` | Flash over the network, plus `INFO` | [below](#_mbflash_tcp-info-and-flash) |
+| `_mbserial._tcp.local.` | Raw serial pass-through | A raw byte pipe — see below |
+| `_mbflash._tcp.local.` | Flash over the network, plus `INFO` | A line protocol — see below |
 
 Each service's TXT record carries `uid`, `role`, `common_name`, `enum`, and
 `port`.
