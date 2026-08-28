@@ -16,6 +16,20 @@ resolved against the **live** serial-port mapping — the board on that port
 right now — never against the registry's remembered `port`, which goes stale
 as the OS renames ports across reconnects.
 
+## Documentation
+
+The full manual is published at
+**<https://robots.jointheleague.org/subsystems/mbdeploy/>** — concepts, the complete
+command reference, the `serve` wire protocols, and generic deployment instructions.
+It is written from `docs/wiki/` in this repo, which is the source of truth.
+
+The machines it gets deployed to — hosts, SSH access, per-node install paths and
+current daemon status — are on the internal Robot Garage wiki at
+**<http://robot-garage.home/doku.php?id=mbdeploy>** (garage LAN only). The public
+manual deliberately carries no machine specifics.
+
+If you change how `mbdeploy` behaves, update both. See `AGENTS.md` for the rule.
+
 ## Addressing a board
 
 A board is addressed by its **own** five-letter name (`tovez`, `gopiv`), by its
