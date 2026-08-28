@@ -91,6 +91,36 @@ def _looks_transient(output: str) -> bool:
     return any(sig in lowered for sig in _TRANSIENT_SIGNATURES)
 
 
+#: A locked/protected nRF (APPROTECT set, or a protected SoftDevice
+#: region at 0x0) that rejects every flash-algorithm erase -- only a
+#: CTRL-AP mass erase (ERASEALL) clears it, per UC-009. This is the
+#: *only* signature that justifies a mass erase; anything that matches
+#: neither this list nor ``_TRANSIENT_SIGNATURES`` above is deliberately
+#: treated as unrecoverable rather than assumed locked (see
+#: sprint.md's Design Rationale) -- an unrecognized failure that was a
+#: real lock costs one manual ``pyocd erase --mass``; treating an
+#: unrecognized failure as locked and erasing anyway can cost a board's
+#: firmware.
+_LOCKED_SIGNATURES = (
+    "0x67",  # observed CMSIS-DAP fault code for a locked-device sector-erase failure
+    "flash erase sector failure",
+    "approtect",
+    "access port protection",
+    "authentication failed",
+    "not authenticated",
+    "device is locked",
+    "target is locked",
+)
+
+
+def _looks_locked(output: str) -> bool:
+    """True if ``output`` (pyocd's captured stdout/stderr) names a
+    locked/protected-device signature recoverable only by a CTRL-AP mass
+    erase."""
+    lowered = output.lower()
+    return any(sig in lowered for sig in _LOCKED_SIGNATURES)
+
+
 def _run_streamed(
     cmd: list[str], log: Callable[[str], None] | None
 ) -> tuple[int, str]:
@@ -165,6 +195,17 @@ def flash_hex(
     :func:`_looks_transient`) is retried exactly once, logged visibly,
     before anything else is decided -- most flaky-USB failures simply
     succeed the second time with no change to the board's state at all.
+
+    A failure that persists past that (or that never looked transient in
+    the first place) is mass-erased and retried only if its output looks
+    *locked* (:func:`_looks_locked`) -- a `0x67` sector-erase failure, or
+    auth/lock/APPROTECT wording. Any other failure (an invalid hex that
+    slipped past validation, a bad ``target_mcu``, or anything else this
+    module doesn't recognize) fails immediately **without** erasing:
+    an unrecognized signature is deliberately never treated as "assume
+    locked," because an unnecessary mass erase destroys a working
+    board's firmware while a missed recovery only costs the operator one
+    manual ``pyocd erase --mass``.
     """
     hex_error = _validate_hex(hex_path)
     if hex_error is not None:
@@ -187,7 +228,7 @@ def flash_hex(
         )
         rc, output = _run_streamed(flash_cmd, log)
 
-    if rc != 0:
+    if rc != 0 and _looks_locked(output):
         # A locked/protected nRF (APPROTECT set, or a protected SoftDevice
         # region at 0x0) rejects every flash-algorithm erase, so the flash
         # fails before it can program. Neither sector nor chip erase clears
@@ -215,6 +256,18 @@ def flash_hex(
                 f"Error: flash still failed after mass erase (exit {rc}).",
             )
             return rc
+    elif rc != 0:
+        # No recognized signature -- neither transient (already retried
+        # above) nor locked. Fail as-is, without ever mass-erasing: see
+        # the "unrecognized = don't erase" rationale above.
+        _log(
+            log,
+            f"Error: flash failed (exit {rc}) with no recognized "
+            "recoverable signature -- not mass-erasing. If this device "
+            "is actually locked/protected, run 'pyocd erase --mass' "
+            "manually.",
+        )
+        return rc
 
     reset_cmd = [
         *_PYOCD, "reset",

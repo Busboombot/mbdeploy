@@ -42,6 +42,12 @@ _PYOCD = [sys.executable, "-m", "pyocd"]
 #: A minimal, complete, valid Intel HEX file: just the EOF record.
 _VALID_HEX_CONTENT = ":00000001FF\n"
 
+#: A locked-device failure signature (see flash.py::_LOCKED_SIGNATURES).
+#: Ticket 003 gates the mass-erase branch on this text appearing in the
+#: failed flash's output, so every fake below that expects the recovery
+#: path to fire now emits this line instead of failing silently.
+_LOCKED_SIGNATURE_LINES = ("flash erase sector failure (0x67)",)
+
 
 @pytest.fixture
 def valid_hex(tmp_path) -> str:
@@ -118,7 +124,9 @@ class TestArgvConstruction:
             calls.append(cmd)
             if "flash" in cmd:
                 state["flash"] += 1
-                return _result(1 if state["flash"] == 1 else 0)
+                if state["flash"] == 1:
+                    return _result(1, _LOCKED_SIGNATURE_LINES)
+                return _result(0)
             return _result(0)
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
@@ -148,10 +156,10 @@ class TestMassEraseRecovery:
             calls.append(cmd)
             if "flash" in cmd:
                 state["flash"] += 1
-                rc = 1 if state["flash"] == 1 else 0   # first flash fails
-            else:
-                rc = 0                                  # erase / reset succeed
-            return _result(rc)
+                if state["flash"] == 1:                 # first flash fails
+                    return _result(1, _LOCKED_SIGNATURE_LINES)
+                return _result(0)
+            return _result(0)                           # erase / reset succeed
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
@@ -168,12 +176,10 @@ class TestMassEraseRecovery:
         def fake_run(cmd, **kw):
             if "flash" in cmd:
                 state["flash"] += 1
-                rc = 1
+                return _result(1, _LOCKED_SIGNATURE_LINES)
             elif "erase" in cmd:
-                rc = 5
-            else:
-                rc = 0
-            return _result(rc)
+                return _result(5)
+            return _result(0)
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
@@ -205,10 +211,8 @@ class TestMassEraseRecovery:
         def fake_run(cmd, **kw):
             if "flash" in cmd:
                 state["flash"] += 1
-                rc = 7
-            else:
-                rc = 0  # erase succeeds
-            return _result(rc)
+                return _result(7, _LOCKED_SIGNATURE_LINES)
+            return _result(0)  # erase succeeds
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
@@ -225,7 +229,7 @@ class TestLogRouting:
     def test_log_none_prints_to_stderr(self, monkeypatch, capsys, valid_hex):
         def fake_run(cmd, **kw):
             if "flash" in cmd:
-                return _result(1)
+                return _result(1, _LOCKED_SIGNATURE_LINES)
             elif "erase" in cmd:
                 return _result(5)
             return _result(0)
@@ -244,7 +248,7 @@ class TestLogRouting:
 
         def fake_run(cmd, **kw):
             if "flash" in cmd:
-                return _result(1)
+                return _result(1, _LOCKED_SIGNATURE_LINES)
             elif "erase" in cmd:
                 return _result(5)
             return _result(0)
@@ -367,47 +371,152 @@ class TestTransientRetry:
         self, monkeypatch, valid_hex
     ):
         """Two consecutive transient failures give up after the one
-        retry -- not a loop -- and proceed to the (existing) post-flash
-        handling exactly once more."""
+        retry -- not a loop -- and, since a merely-transient signature is
+        never treated as locked (ticket 003), fail without ever
+        mass-erasing, returning the retried flash's own rc.
+        """
+        calls: list[list[str]] = []
         state = {"flash": 0}
 
         def fake_run(cmd, **kw):
+            calls.append(cmd)
             if "flash" in cmd:
                 state["flash"] += 1
                 return _result(1, ("DAPAccess Error: some transient fault",))
-            if "erase" in cmd:
-                # Erase itself fails here purely to short-circuit the
-                # sequence right after the retry, so this test can assert
-                # "exactly one retry" without depending on ticket 003's
-                # (not-yet-landed) locked-signature gate.
-                return _result(9)
             return _result(0)
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
-        assert rc == 9
-        assert state["flash"] == 2                      # exactly one retry
+        assert rc == 1                                   # the retried flash's own rc
+        assert state["flash"] == 2                        # exactly one retry, not a loop
+        assert not any("erase" in c for c in calls)        # never reaches the erase branch
 
     def test_non_transient_failure_is_not_retried(self, monkeypatch, valid_hex):
-        """A failure with no transient signature is not retried at all."""
+        """A failure with no transient signature is not retried at all,
+        and -- since it is also not a locked signature -- never
+        mass-erases either (this is the headline sprint 004 fix: an
+        unrecognized pyocd failure must never trigger erase --mass)."""
+        calls: list[list[str]] = []
         state = {"flash": 0}
 
         def fake_run(cmd, **kw):
+            calls.append(cmd)
             if "flash" in cmd:
                 state["flash"] += 1
                 return _result(1, ("some unrelated pyocd error",))
-            if "erase" in cmd:
-                return _result(9)  # short-circuit, see test above
             return _result(0)
 
         monkeypatch.setattr(subprocess, "Popen", fake_run)
 
         rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
 
-        assert rc == 9
-        assert state["flash"] == 1                      # no retry at all
+        assert rc == 1
+        assert state["flash"] == 1                        # no retry at all
+        assert not any("erase" in c for c in calls)
+
+
+class TestSignatureGating:
+    """Ticket 003: mass erase fires only for a locked/protected signature.
+
+    This is the headline sprint 004 fix -- before this ticket, flash_hex
+    mass-erased on *any* non-zero pyocd exit, which the field report
+    behind this sprint shows wiping a working board over a malformed hex
+    file (ticket 001 already stops that specific case before it reaches
+    pyocd at all; this class covers every other failure shape that
+    reaches a real pyocd invocation).
+    """
+
+    def test_0x67_sector_erase_failure_triggers_mass_erase(
+        self, monkeypatch, valid_hex
+    ):
+        """A 0x67 sector-erase failure still triggers mass-erase recovery,
+        exactly as before this sprint."""
+        calls: list[list[str]] = []
+        state = {"flash": 0}
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "flash" in cmd:
+                state["flash"] += 1
+                if state["flash"] == 1:
+                    return _result(1, ("flash erase sector failure (0x67)",))
+                return _result(0)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
+
+        assert rc == 0
+        assert state["flash"] == 2
+        assert any("erase" in c and "--mass" in c for c in calls)
+
+    def test_approtect_signature_triggers_mass_erase(self, monkeypatch, valid_hex):
+        """APPROTECT wording is also recognized as a locked signature."""
+        calls: list[list[str]] = []
+        state = {"flash": 0}
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "flash" in cmd:
+                state["flash"] += 1
+                if state["flash"] == 1:
+                    return _result(1, ("Error: APPROTECT is enabled.",))
+                return _result(0)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
+
+        assert rc == 0
+        assert any("erase" in c and "--mass" in c for c in calls)
+
+    def test_malformed_hex_never_reaches_erase_mass(self, monkeypatch, tmp_path):
+        """The headline regression: a malformed hex must never appear
+        anywhere near an ``erase --mass`` invocation. Ticket 001 already
+        stops this before any subprocess runs at all; this asserts it
+        directly at the flash_hex level, independent of how the guard is
+        implemented internally."""
+        bad_path = tmp_path / "bad.hex"
+        bad_path.write_text("not a valid hex file\n")
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(_UID, str(bad_path), target_mcu=_MCU)
+
+        assert rc != 0
+        assert not any("erase" in c and "--mass" in c for c in calls)
+        assert calls == []
+
+    def test_bad_target_mcu_style_failure_never_erases(self, monkeypatch, valid_hex):
+        """An unrecognized pyocd error (e.g. an unknown --target-mcu)
+        fails outright -- it is never treated as 'assume locked'."""
+        calls: list[list[str]] = []
+        state = {"flash": 0}
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "flash" in cmd:
+                state["flash"] += 1
+                return _result(1, ("Target type nrf99999 is not recognized.",))
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu="nrf99999")
+
+        assert rc == 1
+        assert state["flash"] == 1
+        assert not any("erase" in c for c in calls)
 
 
 class TestHexValidation:

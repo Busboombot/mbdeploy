@@ -80,6 +80,13 @@ def _make_args(
     )
 
 
+#: A locked-device failure signature (see flash.py::_LOCKED_SIGNATURES).
+#: Ticket 003 gates flash.py's mass-erase branch on this text appearing
+#: in the failed flash's output, so every fake below that expects the
+#: recovery path to fire emits this line instead of failing silently.
+_LOCKED_SIGNATURE_LINES = ("flash erase sector failure (0x67)",)
+
+
 @pytest.fixture
 def valid_hex_path(tmp_path) -> str:
     """A real, on-disk, valid Intel HEX file's path.
@@ -1387,10 +1394,10 @@ class TestMassEraseRecovery:
             calls.append(cmd)
             if "flash" in cmd:
                 state["flash"] += 1
-                rc = 1 if state["flash"] == 1 else 0   # first flash fails
-            else:
-                rc = 0                                  # erase / reset succeed
-            return _FakePyocdProcess(rc)
+                if state["flash"] == 1:                 # first flash fails
+                    return _FakePyocdProcess(1, _LOCKED_SIGNATURE_LINES)
+                return _FakePyocdProcess(0)
+            return _FakePyocdProcess(0)                  # erase / reset succeed
 
         import subprocess
         monkeypatch.setattr(subprocess, "Popen", fake_run)
@@ -1411,12 +1418,10 @@ class TestMassEraseRecovery:
         def fake_run(cmd, **kw):
             if "flash" in cmd:
                 state["flash"] += 1
-                rc = 1
+                return _FakePyocdProcess(1, _LOCKED_SIGNATURE_LINES)
             elif "erase" in cmd:
-                rc = 5
-            else:
-                rc = 0
-            return _FakePyocdProcess(rc)
+                return _FakePyocdProcess(5)
+            return _FakePyocdProcess(0)
 
         import subprocess
         monkeypatch.setattr(subprocess, "Popen", fake_run)
