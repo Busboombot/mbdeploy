@@ -66,11 +66,11 @@ class FakeFlash:
     def __init__(self, rc: int = 0, log_lines: tuple[str, ...] = ()) -> None:
         self.rc = rc
         self.log_lines = list(log_lines)
-        self.calls: list[tuple[str, str, str]] = []
+        self.calls: list[tuple[str, str, str, str | None]] = []
         self.written_payload: bytes | None = None
 
-    def __call__(self, uid, hex_path, target_mcu, log=None):
-        self.calls.append((uid, hex_path, target_mcu))
+    def __call__(self, uid, hex_path, target_mcu, log=None, board_name=None):
+        self.calls.append((uid, hex_path, target_mcu, board_name))
         with open(hex_path, "rb") as f:
             self.written_payload = f.read()
         if log is not None:
@@ -93,8 +93,8 @@ class SlowFakeFlash(FakeFlash):
         super().__init__(rc=rc, log_lines=log_lines)
         self.delay = delay
 
-    def __call__(self, uid, hex_path, target_mcu, log=None):
-        self.calls.append((uid, hex_path, target_mcu))
+    def __call__(self, uid, hex_path, target_mcu, log=None, board_name=None):
+        self.calls.append((uid, hex_path, target_mcu, board_name))
         with open(hex_path, "rb") as f:
             self.written_payload = f.read()
         if log is not None:
@@ -555,6 +555,10 @@ class TestServeFlash:
             assert lines == [b"LOG erasing", b"LOG programming", b"OK flashed"]
             assert len(fake_flash.calls) == 1
             assert fake_flash.calls[0][0] == _UID
+            # Ticket 004: serve_flash passes the board's name through so
+            # flash_hex's blank-board message (on erase-then-failed-reflash)
+            # can name it, rather than falling back to the bare uid.
+            assert fake_flash.calls[0][3] == board.name
             assert fake_flash.written_payload == payload
         finally:
             client.close()
@@ -797,7 +801,7 @@ class TestServeFlash:
         release_flash = threading.Event()
         calls: list[str] = []
 
-        def slow_flash_hex(uid, hex_path, target_mcu, log=None):
+        def slow_flash_hex(uid, hex_path, target_mcu, log=None, board_name=None):
             calls.append(uid)
             release_flash.wait(timeout=2.0)
             return 0

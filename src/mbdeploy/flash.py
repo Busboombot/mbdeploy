@@ -168,6 +168,7 @@ def flash_hex(
     hex_path: str,
     target_mcu: str = DEFAULT_MCU,
     log: Callable[[str], None] | None = None,
+    board_name: str | None = None,
 ) -> int:
     """Flash ``hex_path`` to the board behind ``uid``, with mass-erase recovery.
 
@@ -206,6 +207,14 @@ def flash_hex(
     locked," because an unnecessary mass erase destroys a working
     board's firmware while a missed recovery only costs the operator one
     manual ``pyocd erase --mass``.
+
+    If the mass erase itself succeeds but the retried flash still fails,
+    the board has no firmware at all -- the erase already wiped it and
+    reflashing didn't take. That is reported explicitly and unmissably
+    through ``log`` (not only local stderr), naming the board via
+    ``board_name`` (falling back to ``uid`` when not given), so a remote
+    operator over ``deploy --remote`` sees it too, not just "flashing
+    failed."
     """
     hex_error = _validate_hex(hex_path)
     if hex_error is not None:
@@ -251,9 +260,12 @@ def flash_hex(
             return erase_rc
         rc, output = _run_streamed(flash_cmd, log)
         if rc != 0:
+            name = board_name or uid
             _log(
                 log,
-                f"Error: flash still failed after mass erase (exit {rc}).",
+                f"Error: flash still failed after mass erase (exit {rc}) "
+                f"— {name} WAS ERASED AND NOW HAS NO FIRMWARE. It will "
+                "not run until it is successfully reflashed.",
             )
             return rc
     elif rc != 0:

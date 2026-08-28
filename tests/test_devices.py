@@ -1451,3 +1451,28 @@ class TestMassEraseRecovery:
 
         assert rc == 0
         assert not any("erase" in c for c in calls)
+
+    def test_blank_board_message_names_the_device_after_failed_reflash(
+        self, monkeypatch, tmp_path, capsys, valid_hex_path
+    ):
+        """Ticket 004: erase succeeds but the retried flash still fails --
+        _cmd_deploy passes _device_label(entry) through as flash_hex's
+        board_name, so the explicit "board is now blank" message names
+        the device the operator actually typed, not the bare uid."""
+        config = self._connect_one_device(monkeypatch, tmp_path)
+
+        def fake_run(cmd, **kw):
+            if "flash" in cmd:
+                return _FakePyocdProcess(7, ("flash erase sector failure (0x67)",))
+            return _FakePyocdProcess(0)  # erase succeeds
+
+        import subprocess
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        args = _make_args(target=_DEVICE_UID, config=str(config), hex_path=valid_hex_path)
+        rc = _cmd_deploy(args)
+
+        assert rc == 7
+        err = capsys.readouterr().err.lower()
+        assert "gutov-main" in err               # _device_label(_DEVICE_ENTRY)
+        assert "no firmware" in err

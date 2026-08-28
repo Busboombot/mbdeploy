@@ -519,6 +519,100 @@ class TestSignatureGating:
         assert not any("erase" in c for c in calls)
 
 
+class TestBlankBoardMessage:
+    """Ticket 004: erase-then-failed-reflash must say, explicitly and
+    unmissably, that the board is now blank -- through ``log``, not only
+    local stderr -- naming the board.
+    """
+
+    def _fake_locked_then_still_failing(self):
+        """flash always fails with a locked signature; erase succeeds;
+        the retried flash still fails -- the exact erase-then-failed-
+        reflash scenario this ticket covers."""
+        state = {"flash": 0}
+
+        def fake_run(cmd, **kw):
+            if "flash" in cmd:
+                state["flash"] += 1
+                return _result(7, _LOCKED_SIGNATURE_LINES)
+            return _result(0)  # erase succeeds
+
+        return fake_run
+
+    def test_blank_board_message_names_the_board_via_log(self, monkeypatch, valid_hex):
+        messages: list[str] = []
+        monkeypatch.setattr(
+            subprocess, "Popen", self._fake_locked_then_still_failing()
+        )
+
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU,
+            log=messages.append, board_name="gutov-main",
+        )
+
+        assert rc == 7                                    # unchanged rc contract
+        assert any(
+            "gutov-main" in m and "no firmware" in m.lower() for m in messages
+        )
+
+    def test_blank_board_message_falls_back_to_uid_without_board_name(
+        self, monkeypatch, capsys, valid_hex
+    ):
+        monkeypatch.setattr(
+            subprocess, "Popen", self._fake_locked_then_still_failing()
+        )
+
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU)
+
+        assert rc == 7
+        err = capsys.readouterr().err
+        assert _UID in err
+        assert "no firmware" in err.lower()
+
+    def test_blank_board_message_reaches_log_not_only_stderr(
+        self, monkeypatch, capsys, valid_hex
+    ):
+        """The message must be routed through a supplied ``log`` --
+        stderr must stay clean when a caller supplies one, exactly like
+        every other flash_hex message (see TestLogRouting)."""
+        messages: list[str] = []
+        monkeypatch.setattr(
+            subprocess, "Popen", self._fake_locked_then_still_failing()
+        )
+
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU,
+            log=messages.append, board_name="gutov-main",
+        )
+
+        assert rc == 7
+        assert capsys.readouterr().err == ""
+        assert any("no firmware" in m.lower() for m in messages)
+
+    def test_erase_failure_makes_no_blank_board_claim(self, monkeypatch, valid_hex):
+        """If the mass erase itself fails, the firmware is generally
+        still intact -- no blank-board claim should ever be made."""
+        messages: list[str] = []
+
+        def fake_run(cmd, **kw):
+            if "flash" in cmd:
+                return _result(1, _LOCKED_SIGNATURE_LINES)
+            elif "erase" in cmd:
+                return _result(5)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU,
+            log=messages.append, board_name="gutov-main",
+        )
+
+        assert rc == 5
+        assert not any("no firmware" in m.lower() for m in messages)
+        assert any("mass erase failed" in m.lower() for m in messages)
+
+
 class TestHexValidation:
     """Ticket 001: a bad hex file must never reach pyocd at all."""
 
