@@ -117,34 +117,34 @@ blocking on a single `subprocess.run()` per pyocd invocation:
 
 ## Acceptance Criteria
 
-- [ ] `flash_hex` streams pyocd's stdout line by line (not a single
+- [x] `flash_hex` streams pyocd's stdout line by line (not a single
       blocking call per subprocess) and routes each line through
       `_log()`, so a caller-supplied `log` callback receives progress
       lines throughout the flash, not just at the three fixed
       transition messages.
-- [ ] `log=None` still prints every line — transition messages and
+- [x] `log=None` still prints every line — transition messages and
       streamed pyocd output alike — to stderr.
-- [ ] `tests/test_flash.py` (`TestArgvConstruction`,
+- [x] `tests/test_flash.py` (`TestArgvConstruction`,
       `TestMassEraseRecovery`, `TestLogRouting`) passes, adapted only as
       needed for the `Popen` switch, with no change to what each test
       actually verifies (argv shape, retry/erase control flow, return
       codes, log routing).
-- [ ] `tests/test_devices.py::TestMassEraseRecovery`'s three tests pass
+- [x] `tests/test_devices.py::TestMassEraseRecovery`'s three tests pass
       unchanged in intent (adapted only as needed for the `Popen`
       switch).
-- [ ] Return codes are unchanged: mass-erase failure returns the erase
+- [x] Return codes are unchanged: mass-erase failure returns the erase
       rc, a still-failing flash after mass erase returns the flash rc,
       success returns the reset rc.
-- [ ] `serve_flash` (server side, unchanged by this ticket) is confirmed
+- [x] `serve_flash` (server side, unchanged by this ticket) is confirmed
       to relay each `LOG` line to the client as it arrives — i.e. the
       streaming actually reaches `remote.py`'s client, not just
       `flash_hex`'s own `log` parameter in isolation. Add or extend a
       `test_server.py`/`test_flash.py` case if the current suite doesn't
       already cover a multi-line, time-spread `log` sequence being
       relayed as multiple `LOG` lines rather than coalesced or dropped.
-- [ ] Full automated suite passes: `uv run pytest` (or
+- [x] Full automated suite passes: `uv run pytest` (or
       `.venv/bin/python -m pytest -q`).
-- [ ] **Re-run against real Nolanet hardware**: from this Mac, across
+- [x] **Re-run against real Nolanet hardware**: from this Mac, across
       the LAN, `deploy --remote togov --hex <the same ~450 KB hex that
       failed in ticket 009>` (e.g. `micropython-microbit-v2.1.1.hex`)
       against `togov` on `loki` (192.168.1.149 — genuinely silent
@@ -157,7 +157,7 @@ blocking on a single `subprocess.run()` per pyocd invocation:
       however this project's existing update mechanism works) before
       re-testing — testing against the node's stale pre-fix copy would
       not exercise the fix at all.
-- [ ] The re-run's result (commands, raw output/timestamps, exit code,
+- [x] The re-run's result (commands, raw output/timestamps, exit code,
       confirmation that `~/mbdeploy` on `loki` was updated first) is
       recorded — either as a new section in
       `docs/acceptance/003-009-multi-node-acceptance.md` or a new
