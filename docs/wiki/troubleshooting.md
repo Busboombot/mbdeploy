@@ -182,6 +182,20 @@ flight. The client refuses to guess and lists every candidate's host and port.
 This is also what a misused `serve --service-name` on a multi-board host looks
 like — that flag renames *every* board the process manages.
 
+### A board advertises as `mb-<something>`, or two boards share that name
+
+The daemon could name it neither from the SWD read nor from an announcement, so
+it fell back to `mb-<last 8 of uid>`. That suffix is **the same on every
+micro:bit**, so every board in this state advertises the same name; a second one
+is renamed by zeroconf to `mb-… (2)`, and neither can be reliably addressed.
+
+Two things to do. First, treat it as a signal that the SWD name read is failing
+for that board — a blank DEVICE NAME in a local `mbdeploy list` on that node
+confirms it — and find out why (busy probe, locked part, cabling). Second, until
+the underlying defect is fixed, `serve --service-name NAME` can give a
+single-board host an unambiguous name. Tracked in
+[Open tasks](/subsystems/mbdeploy/).
+
 ### `refused the connection: busy`
 
 Another serial session or a flash already occupies that board. Serial sessions

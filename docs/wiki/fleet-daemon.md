@@ -75,8 +75,19 @@ board arrives, from this chain:
    probe. This is the normal path in practice, not a rare fallback: it works on a
    board that runs no announcing firmware at all.
 2. **`device_name`** — from a serial announcement, used if the SWD read failed.
-3. **`mb-<last 8 of uid>`** — last resort, so a board is always nameable even
-   with neither of the above.
+3. **`mb-<last 8 of uid>`** — last resort, so a board always has *some* name.
+
+> **The third rung does not distinguish boards.** Every micro:bit UID ends in
+> the same eight hex characters — that suffix is a DAPLink product/firmware
+> value, not a per-board one — so **every** board that falls through to the
+> fallback advertises as the same `mb-…` name. Two such boards collide, and
+> zeroconf renames one to `mb-… (2)`; across two hosts they are
+> indistinguishable, and neither can be reliably addressed by name. The
+> per-board entropy lives in the middle of the UID, not at its end. This is a
+> known defect, not a design intent — see
+> [Open tasks](/subsystems/mbdeploy/). A board only reaches this rung when the
+> SWD name read failed *and* it has never announced, which is worth
+> investigating on its own; nothing is logged when it happens.
 
 `--service-name NAME` overrides the chain entirely, for every board that process
 manages. It is only meaningful on a single-board host: on a multi-board host

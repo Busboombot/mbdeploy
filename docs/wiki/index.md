@@ -76,9 +76,9 @@ Both the local guard and the daemon's guard read the registry's `role` field,
 which is populated only from a board's serial announcement. On a board that has
 never announced, `role` is empty, `is_relay()` returns `False`, and no `FLASH`
 is ever refused for being a relay — `--force-relay` or not. On a fleet of silent
-boards the relay tag has nothing to read, so **`--no-flash` and
-`--token`/`--token-file` are the real access controls** for such a deployment.
-Do not assume the relay guard is doing any work there.
+boards the relay tag has nothing to read. Do not assume the relay guard is doing
+any work there: **`--no-flash` is the access control that actually functions
+today**, and the token would be the other one if a client could send it (gap 1).
 
 **3. macOS only: `serve` can throw at process exit.**
 With hardware attached, `mbdeploy serve` on macOS can hit an
@@ -88,6 +88,18 @@ defect, and it happens after the daemon has already unregistered its mDNS
 advertisements and closed its sockets. It was explicitly verified **not** to
 reproduce on Linux/aarch64 (47 consecutive clean process exits with real
 hardware attached).
+
+**4. The `mb-<uid8>` mDNS fallback name is the same for every board.**
+When the daemon can name a board neither by its SWD read nor by an
+announcement, it advertises it as `mb-<last 8 of uid>`. Every micro:bit UID ends
+in the same eight hex characters (a DAPLink product/firmware suffix), so every
+board in that state gets an identical name: they collide, zeroconf renames one
+to `mb-… (2)`, and across hosts they cannot be told apart — which matters
+precisely because the advertised name *is* the network address. The per-board
+entropy is in the middle of the UID; a fix should use a slice that actually
+varies, or a short digest of the whole UID, and should log a warning when the
+fallback fires at all. Boards in this state have already been observed on real
+hardware.
 
 ## Notes for whoever edits this next
 
