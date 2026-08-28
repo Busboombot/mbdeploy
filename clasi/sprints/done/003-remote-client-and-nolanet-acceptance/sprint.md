@@ -1,7 +1,7 @@
 ---
 id: '003'
 title: Remote client and Nolanet acceptance
-status: executing
+status: done
 branch: sprint/003-remote-client-and-nolanet-acceptance
 use-cases:
 - SUC-010
