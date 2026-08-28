@@ -1,7 +1,7 @@
 ---
 id: '001'
 title: Validate hex file before any pyocd call
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 depends-on: []

@@ -1,9 +1,11 @@
 ---
 id: '004'
 title: Report explicitly when erase-then-failed-reflash leaves a board blank
-status: in-progress
-use-cases: [SUC-004]
-depends-on: ['003']
+status: done
+use-cases:
+- SUC-004
+depends-on:
+- '003'
 github-issue: ''
 issue: deploy-leaves-a-board-blank-without-saying-so.md
 completes_issue: true

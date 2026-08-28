@@ -1,9 +1,11 @@
 ---
 id: '002'
 title: Capture pyocd output and retry once on a transient probe signature
-status: in-progress
-use-cases: [SUC-002]
-depends-on: ['001']
+status: done
+use-cases:
+- SUC-002
+depends-on:
+- '001'
 github-issue: ''
 issue: retry-once-on-transient-probe-errors.md
 completes_issue: true

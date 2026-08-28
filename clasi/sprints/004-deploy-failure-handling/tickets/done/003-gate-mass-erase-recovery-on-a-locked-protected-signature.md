@@ -1,9 +1,12 @@
 ---
 id: '003'
 title: Gate mass-erase recovery on a locked/protected signature
-status: in-progress
-use-cases: [SUC-003]
-depends-on: ['001', '002']
+status: done
+use-cases:
+- SUC-003
+depends-on:
+- '001'
+- '002'
 github-issue: ''
 issue: mass-erase-fires-on-failures-it-cannot-fix-and-wipes-working-boards.md
 completes_issue: true
