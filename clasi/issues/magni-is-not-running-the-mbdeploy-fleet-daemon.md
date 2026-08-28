@@ -6,25 +6,33 @@ status: pending
 
 ## What is wrong
 
-Three of Nolanet's four nodes run `mbdeploy serve` as a systemd system
-unit and advertise their board over mDNS:
+`magni` is the one Nolanet node not running `mbdeploy serve`.
+`mbdeploy serve --install-service --system` needs `sudo`, and `jtl` has no
+passwordless sudo rule on `magni` (it does on `hodr`, `loki`, and
+`meili`). This was hit twice: sprint 003 ticket 007 (`apt clean`) and
+ticket 008 (the unit install). The application itself is installed at
+`~/mbdeploy` with a working venv — only the service is missing.
 
-| Node | Board | Daemon |
+## Current state (2026-08-27, re-measured after the sprint closed)
+
+The hardware moved during the arc. `magni` now has **no micro:bit attached
+at all**, and `hodr` has **two** (`/dev/ttyACM0` and `/dev/ttyACM1`):
+
+| Node | Boards | Daemon |
 |---|---|---|
-| hodr .148 | `vevav` | active, enabled |
-| loki .149 | `togov` | active, enabled |
-| meili .150 | `gitev` | active, enabled |
-| **magni .147** | `tigez` | **not deployed** |
+| magni .147 | **0** | not deployed |
+| hodr .148 | 2 — `vevav`, `tigez` | active, enabled |
+| loki .149 | 1 — `togov` | active, enabled |
+| meili .150 | 1 — `gitev` | active, enabled |
 
-`magni` has the application installed at `~/mbdeploy` with a working venv,
-and `mbdeploy probe` there correctly reports `/dev/ttyACM0` — only the
-service is missing. `mbdeploy serve --install-service --system` needs
-`sudo`, and `jtl` has no passwordless sudo rule on `magni` (it does on
-`hodr`, `loki`, and `meili`). This was hit twice: sprint 003 ticket 007
-(`apt clean`) and ticket 008 (the unit install).
+`mbdeploy list --remote` shows all four boards across three hosts, so no
+board is currently unreachable. **Deploying to `magni` is therefore not
+urgent** — it matters only when a board is plugged back into it.
 
-Consequence: `mbdeploy list --remote` shows 3 boards, not 4, and `tigez`
-is unreachable over the LAN.
+Worth recording: `hodr` picked up its second board as a live hotplug
+arrival and advertised it with no restart, which is the first real-hardware
+exercise of both the arrival path and the multi-board-per-host case. The
+sprint's planning assumed one board per node throughout.
 
 ## Options
 
