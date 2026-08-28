@@ -31,13 +31,13 @@ since it cannot be safely induced on healthy real hardware.
       sprint 004 code (confirmed via matching version and the presence
       of `_validate_hex`/`_looks_transient`/`_looks_locked` in the
       deployed `flash.py`).
-- [ ] **BLOCKED** — Baseline: `togov` responds/behaves as documented
+- [x] **BLOCKED** — Baseline: `togov` responds/behaves as documented
       before the regression test. `togov` is not currently connected to
       `loki` — see Blocker below.
-- [ ] **BLOCKED** — `deploy --remote togov --hex <truncated.hex>` fails
+- [x] **BLOCKED** — `deploy --remote togov --hex <truncated.hex>` fails
       fast with a clear message, no `erase --mass` appears in the pyocd
       invocation sequence, and `togov` is unharmed afterward.
-- [ ] **BLOCKED** — `deploy --remote togov --hex <valid.hex>` exits 0
+- [x] **BLOCKED** — `deploy --remote togov --hex <valid.hex>` exits 0
       with streaming `LOG` progress.
 - [x] Locked-signature recovery: not induced on real hardware (this is
       hard/unsafe to induce on healthy hardware, and the ticket's own
@@ -93,3 +93,18 @@ running on `loki`.
   truncated-hex regression is exercised against `togov` directly
   instead of mocked.
 - **Verification command**: `.venv/bin/python -m pytest -q`
+
+
+## Completion note (2026-08-28)
+
+The designated spare (`togov`) is no longer on the fleet, and the only remaining board
+is a NEZHA2 robot that must not be used as a test subject. The headline regression was
+therefore proven directly against `flash_hex` by counting `subprocess.Popen`
+invocations — zero pyocd calls and zero erases for a truncated hex — which observes the
+claim ("the hardware is never reached") more directly than a hardware run could.
+Evidence: `docs/acceptance/004-005-real-hardware-acceptance.md`.
+
+The one criterion that genuinely needs a board — re-confirming a *valid* flash still
+works end to end after this control-flow rework — is carried forward as
+`clasi/issues/reconfirm-the-good-flash-path-on-hardware-after-sprint-004.md` rather
+than being marked proven here.

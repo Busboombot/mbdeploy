@@ -239,3 +239,41 @@ this ticket's steps 2-4 before treating the sprint's headline
 real-hardware success criterion as met. `loki` is left healthy: daemon
 `active`/`enabled` running sprint 004 code, `tovez` unaffected and
 still advertising normally.
+
+---
+
+## Addendum — the headline regression, proven without a board (2026-08-28)
+
+`togov` (the designated spare) is not on the fleet, and the only remaining board is
+`tovez`, a NEZHA2 robot that must not be used as a test subject. Rather than risk it,
+the destructive scenario was proven directly against `flash_hex` by counting
+`subprocess.Popen` invocations — which is *stronger* evidence than a hardware run for
+this particular claim, because it observes that the hardware is never reached at all.
+
+The exact scenario from the field report: a truncated MicroPython hex (400,000 bytes of
+a 637,120-byte file, no EOF record), passed to `flash_hex` with a `log` callback.
+
+```
+  exit code       : 1
+  pyocd invoked   : 0 times
+  erase --mass    : 0 times
+  messages        :
+      Error: invalid hex file '/tmp/bad.hex': Hex file contains invalid record at line 9093
+```
+
+Before this sprint, the same input produced a full CTRL-AP mass erase of a working
+board, followed by an identical failure on retry. **The board is now never touched:
+validation short-circuits before the first pyocd subprocess exists.**
+
+### What remains hardware-dependent
+
+One acceptance criterion is genuinely not provable without a spare board:
+
+- **The good path still works on real hardware after this change.** `flash_hex`'s
+  control flow was reworked, so a real flash over `deploy --remote` should be
+  re-confirmed end to end. Sprint 003 ticket 010 proved it (a real 1.2 MB hex, exit 0,
+  streaming `LOG` progress) but that predates these changes.
+
+Tracked as `clasi/issues/reconfirm-the-good-flash-path-on-hardware-after-sprint-004.md`.
+It needs a non-robot board plugged into any fleet node — no code change first; the fix
+is already deployed and running on `loki` (`0.20260827.4`).
