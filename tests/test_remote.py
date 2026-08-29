@@ -527,6 +527,37 @@ def _browse_by_type(**by_type):
 
 
 class TestListRemote:
+    @pytest.fixture(autouse=True)
+    def _no_reverse_dns(self, monkeypatch):
+        """Keep HOST assertions deterministic: never hit real reverse DNS.
+
+        Without this, ``list_remote`` would reverse-resolve the fake IPs
+        below against the test runner's own resolver -- some of which
+        (e.g. 192.168.1.10) may have a real PTR on a dev LAN, changing the
+        HOST value. Stub the lookup to identity so every test here that
+        asserts a raw IP still holds; the conversion itself is covered by
+        ``test_host_is_reverse_resolved_to_hostname``.
+        """
+        monkeypatch.setattr(remote_mod, "_reverse_lookup", lambda host: host)
+
+    def test_host_is_reverse_resolved_to_hostname(self, monkeypatch):
+        """A resolvable IP is shown as its hostname in the HOST column."""
+        monkeypatch.setattr(
+            remote_mod, "_reverse_lookup",
+            lambda host: {"192.168.4.50": "null"}.get(host, host),
+        )
+        entry = _browse_entry(
+            "vevav", "192.168.4.50", 9001,
+            txt={"uid": "u-null", "role": "", "common_name": "", "enum": "1"},
+        )
+        monkeypatch.setattr(
+            remote_mod.mdns, "browse", _browse_by_type(**{SERVICE_TYPE: [entry]}),
+        )
+
+        rows = remote_mod.list_remote()
+
+        assert rows[0]["host"] == "null"
+
     def test_joins_both_service_types_into_one_row_per_board(self, monkeypatch):
         """A board advertising on both service types must be one row, not two."""
         uid = "u-1"

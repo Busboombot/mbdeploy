@@ -318,6 +318,45 @@ def _txt_field(txt: dict, key: str) -> str:
     return "" if value in (None, "") else str(value)
 
 
+def _looks_like_ip(value: str) -> bool:
+    """True if ``value`` parses as an IPv4 or IPv6 literal."""
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, value)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _reverse_lookup(host: str) -> str:
+    """Return a display hostname for ``host``, or ``host`` unchanged.
+
+    ``list --remote``'s HOST column reads better as ``null`` than
+    ``192.168.4.50``, so an IP address is reverse-resolved (PTR) to a
+    name; a host with no PTR record falls back to the address unchanged.
+    A value that is already a name (``mdns.browse``'s ``.local`` fallback
+    when no address resolved) is tidied by trimming a trailing dot and a
+    ``.local`` suffix rather than looked up.
+
+    Display-only: ``resolve_board`` (the ``connect``/``deploy --remote``
+    path) keeps returning the raw address it got from mDNS, so a socket
+    is always opened against the literal the daemon advertised -- never
+    against a name this best-effort lookup produced.
+    """
+    if not host:
+        return host
+    if _looks_like_ip(host):
+        try:
+            return socket.gethostbyaddr(host)[0]
+        except OSError:
+            return host
+    name = host.rstrip(".")
+    if name.endswith(".local"):
+        name = name[: -len(".local")]
+    return name or host
+
+
 def list_remote(timeout: float = 2.0) -> list[dict]:
     """Browse both service types; return one row per board, HOST included.
 
@@ -376,6 +415,15 @@ def list_remote(timeout: float = 2.0) -> list[dict]:
                     row[field_name] = row[field_name] or value
     rows = [grouped[key] for key in order]
     rows.sort(key=lambda r: (r["name"], r["uid"]))
+    # Reverse-resolve the HOST column to hostnames for display, caching so a
+    # host shared by several boards is looked up once per call.
+    host_cache: dict[str, str] = {}
+    for row in rows:
+        host = row["host"]
+        if host:
+            if host not in host_cache:
+                host_cache[host] = _reverse_lookup(host)
+            row["host"] = host_cache[host]
     return rows
 
 
