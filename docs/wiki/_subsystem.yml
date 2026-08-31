@@ -1,4 +1,0 @@
-name: mbdeploy
-title: MB Deploy
-blurb: Build micro:bit firmware and flash it to one board or a whole fleet, over USB or across the LAN.
-order: 100
